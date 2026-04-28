@@ -38,7 +38,7 @@ export function Chat({ nickname, onChangeNickname }: Props) {
   }
 
   return (
-    <div className="absolute bottom-4 right-4 z-40 flex w-80 max-w-[90vw] flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-900/85 shadow-2xl backdrop-blur">
+    <div className="absolute bottom-4 right-4 z-40 flex max-h-[70vh] w-80 max-w-[90vw] flex-col overflow-hidden rounded-2xl border border-slate-700 bg-slate-900/85 shadow-2xl backdrop-blur">
       <header className="flex items-center justify-between gap-2 border-b border-slate-700/60 px-3 py-2">
         <div className="flex items-center gap-2 min-w-0">
           <span
@@ -64,7 +64,7 @@ export function Chat({ nickname, onChangeNickname }: Props) {
         </button>
       </header>
 
-      <div ref={listRef} className="flex-1 h-72 overflow-y-auto px-3 py-2 text-sm">
+      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-2 text-sm">
         {!chatEnabled && (
           <p className="text-amber-300/90 text-xs">
             Chat deshabilitado. Configura las variables VITE_SUPABASE_URL y

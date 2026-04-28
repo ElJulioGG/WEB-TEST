@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { PhysicsCanvas } from './components/PhysicsCanvas'
+import { DrawCanvas } from './components/DrawCanvas'
 import { Chat } from './components/Chat'
 import { NicknameModal } from './components/NicknameModal'
 
@@ -23,7 +23,7 @@ export function App() {
 
   return (
     <div className="relative h-full w-full">
-      <PhysicsCanvas />
+      {nickname && <DrawCanvas nickname={nickname} />}
       {nickname && <Chat nickname={nickname} onChangeNickname={() => setAsking(true)} />}
       {asking && <NicknameModal onSubmit={handleNickname} />}
     </div>
