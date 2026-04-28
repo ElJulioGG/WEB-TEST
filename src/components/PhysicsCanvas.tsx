@@ -35,7 +35,11 @@ const NEXT_FRICTION: Record<FrictionMode, FrictionMode> = {
 
 const HELD_EFFECT_KEYS = new Set(['b', 'v', 'n', 'm', 'q'])
 
-export function PhysicsCanvas() {
+interface PhysicsCanvasProps {
+  interactive?: boolean
+}
+
+export function PhysicsCanvas({ interactive = true }: PhysicsCanvasProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const physicsRef = useRef<PhysicsHandle | null>(null)
@@ -62,12 +66,18 @@ export function PhysicsCanvas() {
 
   const selectedRef = useRef(selected)
   const pausedRef = useRef(paused)
+  const interactiveRef = useRef(interactive)
   useEffect(() => {
     selectedRef.current = selected
   }, [selected])
   useEffect(() => {
     pausedRef.current = paused
   }, [paused])
+  useEffect(() => {
+    interactiveRef.current = interactive
+    // Releasing held keys when leaving play mode prevents stuck effects.
+    if (!interactive) heldKeys.current.clear()
+  }, [interactive])
 
   function showToast(msg: string) {
     setToast(msg)
@@ -154,6 +164,7 @@ export function PhysicsCanvas() {
 
     function onKeyDown(e: KeyboardEvent) {
       if (isTyping(e.target)) return
+      if (!interactiveRef.current) return
       const p = physicsRef.current
       if (!p) return
 
@@ -273,6 +284,7 @@ export function PhysicsCanvas() {
     }
 
     function onKeyUp(e: KeyboardEvent) {
+      if (!interactiveRef.current) return
       const p = physicsRef.current
       const k = e.key.length === 1 ? e.key.toLowerCase() : e.key
       heldKeys.current.delete(k)
@@ -331,15 +343,25 @@ export function PhysicsCanvas() {
   }
 
   return (
-    <div ref={containerRef} className="absolute inset-0 overflow-hidden">
+    <div ref={containerRef} className="pointer-events-none absolute inset-0 overflow-hidden">
       <canvas
         ref={canvasRef}
         onMouseMove={onMouseMove}
         onMouseDown={onMouseDown}
         onMouseUp={onMouseUp}
-        className="block h-full w-full cursor-crosshair"
+        className={`block h-full w-full ${interactive ? 'pointer-events-auto cursor-crosshair' : 'pointer-events-none'}`}
       />
-      {hudVisible && (
+      {party && (
+        <div
+          className="pointer-events-none absolute inset-0 mix-blend-overlay"
+          style={{
+            background:
+              'linear-gradient(45deg, rgba(236,72,153,0.35), rgba(56,189,248,0.35), rgba(250,204,21,0.35))',
+            animation: 'party-shift 4s linear infinite',
+          }}
+        />
+      )}
+      {hudVisible && interactive && (
         <HUD
           selected={selected}
           gravity={gravity}
@@ -354,12 +376,16 @@ export function PhysicsCanvas() {
           onOpenHelp={() => setHelpOpen(true)}
         />
       )}
-      {toast && (
+      {toast && interactive && (
         <div className="pointer-events-none absolute left-1/2 top-10 -translate-x-1/2 rounded-full border border-slate-700/60 bg-slate-900/80 px-4 py-1.5 text-sm text-slate-100 shadow-lg backdrop-blur">
           {toast}
         </div>
       )}
-      {helpOpen && <HelpPanel onClose={() => setHelpOpen(false)} />}
+      {helpOpen && (
+        <div className="pointer-events-auto">
+          <HelpPanel onClose={() => setHelpOpen(false)} />
+        </div>
+      )}
     </div>
   )
 }

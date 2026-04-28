@@ -66,12 +66,23 @@ export function createPhysics(
       width,
       height,
       wireframes: false,
-      background: '#0f172a',
+      background: 'transparent',
       pixelRatio: window.devicePixelRatio || 1,
     },
   })
 
-  const wallStyle = { fillStyle: '#1e293b' }
+  // Matter only "clears" the canvas via fillRect of the background color, which
+  // is a no-op when the background is transparent. Manually clear each frame so
+  // the underlying drawing canvas remains visible behind the bodies.
+  Matter.Events.on(render, 'beforeRender', () => {
+    const ctx = render.context
+    ctx.save()
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.clearRect(0, 0, render.canvas.width, render.canvas.height)
+    ctx.restore()
+  })
+
+  const wallStyle = { fillStyle: '#cbd5e1' }
   let walls: Matter.Body[] = buildWalls(width, height, wallStyle)
   Matter.World.add(world, walls)
 
@@ -89,7 +100,6 @@ export function createPhysics(
 
   let collisionsOn = true
   let friction: FrictionMode = 'normal'
-  let partyMode = false
   const bombCallbacks: (() => void)[] = []
 
   // Wall / corner hit sound — triggers for any entity-vs-static collision.
@@ -118,13 +128,9 @@ export function createPhysics(
     }
   })
 
-  // Party mode: shimmering background hue.
-  Matter.Events.on(render, 'beforeRender', () => {
-    if (partyMode) {
-      const hue = (performance.now() / 18) % 360
-      render.options.background = `hsl(${hue}, 40%, 12%)`
-    }
-  })
+  // Party mode: visual tint is now applied via a CSS overlay in the React layer
+  // (the canvas is transparent, so painting the background here would hide the
+  // drawing layer underneath).
 
   function entityFilter(): Matter.ICollisionFilter {
     return {
@@ -346,9 +352,8 @@ export function createPhysics(
     engine.timing.timeScale = scale
   }
 
-  function setPartyMode(on: boolean) {
-    partyMode = on
-    if (!on) render.options.background = '#0f172a'
+  function setPartyMode(_on: boolean) {
+    // Visual party effect is rendered on the React side as a CSS overlay.
   }
 
   function resize(w: number, h: number) {

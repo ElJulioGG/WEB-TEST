@@ -55,9 +55,10 @@ function genClientId() {
 
 interface Props {
   nickname: string
+  interactive?: boolean
 }
 
-export function DrawCanvas({ nickname }: Props) {
+export function DrawCanvas({ nickname, interactive = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
 
@@ -79,9 +80,25 @@ export function DrawCanvas({ nickname }: Props) {
   const zoomRef = useRef(zoom)
   const panRef = useRef(pan)
   const spaceDownRef = useRef(false)
+  const interactiveRef = useRef(interactive)
 
   useEffect(() => { colorRef.current = color }, [color])
   useEffect(() => { widthRef.current = width }, [width])
+  useEffect(() => {
+    interactiveRef.current = interactive
+    if (!interactive) {
+      // Cancel any in-flight stroke when leaving draw mode.
+      if (myStrokeRef.current) {
+        myStrokeRef.current = null
+        broadcastEnd()
+        requestRender()
+      }
+      spaceDownRef.current = false
+      setSpaceDownState(false)
+      panStateRef.current = null
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interactive])
 
   // Drawing/transport state held in refs (no React re-renders).
   const strokesRef = useRef<Stroke[]>([])
@@ -511,6 +528,7 @@ export function DrawCanvas({ nickname }: Props) {
     }
     function down(e: KeyboardEvent) {
       if (isTyping(e.target)) return
+      if (!interactiveRef.current) return
       if (e.key === ' ') {
         e.preventDefault()
         if (!spaceDownRef.current) {
@@ -592,7 +610,9 @@ export function DrawCanvas({ nickname }: Props) {
         }}
         onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
-        className={`block h-full w-full touch-none select-none ${cursorClass}`}
+        className={`block h-full w-full touch-none select-none ${
+          interactive ? cursorClass : 'pointer-events-none'
+        }`}
       />
 
       {/* Remote cursors overlay */}
@@ -633,24 +653,28 @@ export function DrawCanvas({ nickname }: Props) {
         </div>
       )}
 
-      {/* Toolbar */}
-      <Toolbar
-        color={color}
-        onColor={setColor}
-        width={width}
-        onWidth={setWidth}
-        zoom={zoom}
-        onZoomIn={() => zoomBy(1.25)}
-        onZoomOut={() => zoomBy(1 / 1.25)}
-        onResetView={resetView}
-        onClearMine={clearMine}
-        canClear={chatEnabled}
-      />
+      {/* Toolbar (only visible while drawing is the active mode) */}
+      {interactive && (
+        <Toolbar
+          color={color}
+          onColor={setColor}
+          width={width}
+          onWidth={setWidth}
+          zoom={zoom}
+          onZoomIn={() => zoomBy(1.25)}
+          onZoomOut={() => zoomBy(1 / 1.25)}
+          onResetView={resetView}
+          onClearMine={clearMine}
+          canClear={chatEnabled}
+        />
+      )}
 
       {/* Bottom hint */}
-      <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] uppercase tracking-widest text-slate-500">
-        Click para dibujar · Rueda zoom · Espacio o Click derecho para mover · 0 reset
-      </div>
+      {interactive && (
+        <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] uppercase tracking-widest text-slate-500">
+          Click para dibujar · Rueda zoom · Espacio o Click derecho para mover · 0 reset
+        </div>
+      )}
 
       {!chatEnabled && (
         <div className="pointer-events-none absolute left-4 top-20 max-w-xs rounded-lg border border-amber-300 bg-amber-50/95 px-3 py-2 text-xs text-amber-900 shadow">
