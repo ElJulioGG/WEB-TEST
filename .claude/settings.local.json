@@ -3,7 +3,12 @@
     "allow": [
       "Bash(npm --version)",
       "PowerShell(node --version)",
-      "PowerShell(npm --version)"
+      "PowerShell(npm --version)",
+      "Bash(npm install *)",
+      "Bash(npx tsc *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(npx vite *)",
+      "Bash(git add *)"
     ]
   }
 }

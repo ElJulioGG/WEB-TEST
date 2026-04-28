@@ -42,3 +42,61 @@ create trigger prune_messages_trigger
 
 -- Enable realtime (Supabase default publication).
 alter publication supabase_realtime add table public.messages;
+
+
+-- ============================================================================
+-- Whiteboard strokes (collaborative drawing canvas)
+-- ============================================================================
+
+create table if not exists public.strokes (
+  id         uuid primary key,
+  client_id  text not null,
+  nickname   text not null check (char_length(nickname) between 1 and 32),
+  color      text not null check (char_length(color) between 1 and 16),
+  width      real not null check (width > 0 and width < 200),
+  points     jsonb not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists strokes_created_at_idx on public.strokes (created_at desc);
+create index if not exists strokes_client_id_idx  on public.strokes (client_id);
+
+alter table public.strokes enable row level security;
+
+drop policy if exists "read strokes" on public.strokes;
+create policy "read strokes" on public.strokes
+  for select using (true);
+
+drop policy if exists "insert strokes" on public.strokes;
+create policy "insert strokes" on public.strokes
+  for insert with check (
+    char_length(nickname) between 1 and 32
+    and char_length(color) between 1 and 16
+  );
+
+drop policy if exists "delete strokes" on public.strokes;
+create policy "delete strokes" on public.strokes
+  for delete using (true);
+
+-- Keep the most recent ~5000 strokes (auto-prune on insert).
+create or replace function public.prune_strokes() returns trigger as $$
+begin
+  delete from public.strokes
+  where id in (
+    select id from public.strokes
+    order by created_at desc
+    offset 5000
+  );
+  return null;
+end;
+$$ language plpgsql;
+
+drop trigger if exists prune_strokes_trigger on public.strokes;
+create trigger prune_strokes_trigger
+  after insert on public.strokes
+  for each statement execute function public.prune_strokes();
+
+-- Make DELETE events deliver the row id via realtime.
+alter table public.strokes replica identity full;
+
+alter publication supabase_realtime add table public.strokes;
