@@ -40,8 +40,19 @@ create trigger prune_messages_trigger
   after insert on public.messages
   for each statement execute function public.prune_messages();
 
--- Enable realtime (Supabase default publication).
-alter publication supabase_realtime add table public.messages;
+-- Enable realtime (Supabase default publication). Guarded so the script can
+-- be re-run safely; "alter publication ... add table" is not idempotent.
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'messages'
+  ) then
+    alter publication supabase_realtime add table public.messages;
+  end if;
+end $$;
 
 
 -- ============================================================================
@@ -99,4 +110,14 @@ create trigger prune_strokes_trigger
 -- Make DELETE events deliver the row id via realtime.
 alter table public.strokes replica identity full;
 
-alter publication supabase_realtime add table public.strokes;
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'strokes'
+  ) then
+    alter publication supabase_realtime add table public.strokes;
+  end if;
+end $$;

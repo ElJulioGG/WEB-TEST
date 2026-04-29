@@ -8,7 +8,20 @@
       "Bash(npx tsc *)",
       "Bash(echo \"exit=$?\")",
       "Bash(npx vite *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(gh pr *)",
+      "Bash(command -v gh.exe)",
+      "Read(//c/Program Files/**)",
+      "Read(//c/Users/lio_m/AppData/**)",
+      "Bash(choco --version)",
+      "Bash(winget --version)",
+      "Bash(git credential *)",
+      "Bash(cat)",
+      "Read(//tmp/**)",
+      "Bash(git fetch *)",
+      "Bash(git rev-list *)"
     ]
   }
 }

@@ -38,8 +38,8 @@ export function HUD({
   onOpenHelp,
 }: Props) {
   return (
-    <div className="pointer-events-none absolute inset-0 p-4">
-      {/* Top-left: entity selector */}
+    <div className="pointer-events-none absolute inset-0 px-4 pb-4 pt-16">
+      {/* Top-left: entity selector (sits below the mode toggle) */}
       <div className="flex flex-wrap gap-2">
         {ENTITIES.map((e) => (
           <EntityCard key={e.key} entity={e} active={selected === e.type} />
