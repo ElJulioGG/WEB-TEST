@@ -30,8 +30,22 @@ const PALETTE = [
 const SIZES = [2, 4, 8, 16]
 const HISTORY_LIMIT = 1000
 const CURSOR_TTL_MS = 5000
-const ZOOM_MIN = 0.1
+// The shared drawing surface is a fixed-size page in world coordinates.
+// Everyone shares the same (0,0)..(CANVAS_SIZE,CANVAS_SIZE) plane.
+const CANVAS_SIZE = 4000
+const ZOOM_MIN = 0.05
 const ZOOM_MAX = 8
+
+function clampToCanvas(p: Point): Point {
+  return {
+    x: Math.max(0, Math.min(CANVAS_SIZE, p.x)),
+    y: Math.max(0, Math.min(CANVAS_SIZE, p.y)),
+  }
+}
+
+function isInsideCanvas(p: Point): boolean {
+  return p.x >= 0 && p.x <= CANVAS_SIZE && p.y >= 0 && p.y <= CANVAS_SIZE
+}
 
 function stableColor(seed: string) {
   let h = 0
@@ -113,6 +127,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   const sizeRef = useRef({ w: 0, h: 0, dpr: 1 })
   const renderPendingRef = useRef(false)
   const panStateRef = useRef<{ active: boolean; sx: number; sy: number; startPan: Point } | null>(null)
+  const fittedRef = useRef(false)
 
   function setZoom(v: number) {
     zoomRef.current = v
@@ -143,17 +158,31 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     if (!ctx) return
     const { w, h, dpr } = sizeRef.current
 
+    // Background outside the page (so the canvas boundary is visible).
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.fillStyle = '#ffffff'
+    ctx.fillStyle = '#e2e8f0' // slate-200
     ctx.fillRect(0, 0, w, h)
 
     const z = zoomRef.current
     const p = panRef.current
     ctx.setTransform(dpr * z, 0, 0, dpr * z, dpr * -p.x * z, dpr * -p.y * z)
 
+    // The fixed 4000x4000 white page that everyone shares.
+    ctx.fillStyle = '#ffffff'
+    ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE)
+    ctx.strokeStyle = 'rgba(15, 23, 42, 0.25)'
+    ctx.lineWidth = Math.max(1 / z, 0.5)
+    ctx.strokeRect(0, 0, CANVAS_SIZE, CANVAS_SIZE)
+
+    // Strokes are confined to the page.
+    ctx.save()
+    ctx.beginPath()
+    ctx.rect(0, 0, CANVAS_SIZE, CANVAS_SIZE)
+    ctx.clip()
     for (const s of strokesRef.current) drawStroke(ctx, s)
     for (const s of liveStrokesRef.current.values()) drawStroke(ctx, s)
     if (myStrokeRef.current) drawStroke(ctx, myStrokeRef.current)
+    ctx.restore()
   }
 
   function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke) {
@@ -191,6 +220,12 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       canvas.style.width = w + 'px'
       canvas.style.height = h + 'px'
       sizeRef.current = { w, h, dpr }
+      // Auto-fit the 4000x4000 page into the viewport on first valid size.
+      if (!fittedRef.current && w > 0 && h > 0) {
+        fittedRef.current = true
+        fitToScreen()
+        return
+      }
       requestRender()
     }
     update()
@@ -198,6 +233,21 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     observer.observe(container)
     return () => observer.disconnect()
   }, [])
+
+  function fitToScreen() {
+    const { w, h } = sizeRef.current
+    if (w <= 0 || h <= 0) return
+    const padding = 40
+    const fit = Math.min((w - padding) / CANVAS_SIZE, (h - padding) / CANVAS_SIZE)
+    const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, fit))
+    setZoom(next)
+    // Center the page in the viewport.
+    setPan({
+      x: -(w - CANVAS_SIZE * next) / 2 / next,
+      y: -(h - CANVAS_SIZE * next) / 2 / next,
+    })
+    requestRender()
+  }
 
   // Supabase: load history, subscribe to realtime channel.
   useEffect(() => {
@@ -371,13 +421,18 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     if (e.button !== 0) return
 
     const world = screenToWorld(sx, sy)
+    // Don't start a stroke if the click is outside the bounded page.
+    if (!isInsideCanvas(world)) {
+      broadcastCursor(world, false, true)
+      return
+    }
     myStrokeRef.current = {
       id: newId(),
       client_id: clientId,
       nickname,
       color: colorRef.current,
       width: widthRef.current,
-      points: [world],
+      points: [clampToCanvas(world)],
     }
     setHover(null)
     try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* noop */ }
@@ -407,10 +462,11 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     const world = screenToWorld(sx, sy)
 
     if (myStrokeRef.current) {
+      const next = clampToCanvas(world)
       const last = myStrokeRef.current.points[myStrokeRef.current.points.length - 1]
       const minStep = 0.5 / zoomRef.current
-      if (Math.abs(last.x - world.x) > minStep || Math.abs(last.y - world.y) > minStep) {
-        myStrokeRef.current.points.push(world)
+      if (Math.abs(last.x - next.x) > minStep || Math.abs(last.y - next.y) > minStep) {
+        myStrokeRef.current.points.push(next)
         requestRender()
         broadcastProgress()
       }
@@ -574,9 +630,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   }
 
   function resetView() {
-    setZoom(1)
-    setPan({ x: 0, y: 0 })
-    requestRender()
+    fitToScreen()
   }
 
   async function clearMine() {
@@ -597,7 +651,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   const cursorClass = panStateRef.current?.active || spaceDown ? 'cursor-grabbing' : 'cursor-crosshair'
 
   return (
-    <div ref={containerRef} className="absolute inset-0 overflow-hidden bg-white">
+    <div ref={containerRef} className="absolute inset-0 overflow-hidden bg-slate-200">
       <canvas
         ref={canvasRef}
         onPointerDown={onPointerDown}
@@ -619,7 +673,8 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       <div className="pointer-events-none absolute inset-0">
         {cursors.map((c) => {
           const s = worldToScreen({ x: c.x, y: c.y })
-          if (s.x < -40 || s.y < -40) return null
+          const { w, h } = sizeRef.current
+          if (s.x < -40 || s.y < -40 || s.x > w + 40 || s.y > h + 40) return null
           return (
             <div
               key={c.client_id}
@@ -672,7 +727,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       {/* Bottom hint */}
       {interactive && (
         <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] uppercase tracking-widest text-slate-500">
-          Click para dibujar · Rueda zoom · Espacio o Click derecho para mover · 0 reset
+          Lienzo {CANVAS_SIZE}×{CANVAS_SIZE} · Click para dibujar · Rueda zoom · Espacio o click derecho mueve · 0 ajusta vista
         </div>
       )}
 
@@ -785,7 +840,7 @@ function Toolbar({
           <button
             onClick={onResetView}
             className="min-w-[3.25rem] rounded-lg border border-slate-300 px-2 py-1 text-xs font-mono hover:bg-slate-50"
-            title="Reset view (0)"
+            title="Ajustar lienzo a la vista (0)"
           >
             {Math.round(zoom * 100)}%
           </button>
