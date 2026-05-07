@@ -62,16 +62,40 @@ end $$;
 -- drop the old table if it still exists.
 drop table if exists public.strokes cascade;
 
+-- An earlier version of the schema used a STORED GENERATED column for idx.
+-- That breaks PostgREST upserts in some configs because the conflict-target
+-- column can't be sent in the insert payload. We now compute idx on the
+-- client and just enforce it with a CHECK constraint, so the upsert payload
+-- is fully self-contained. Drop the old table if it still has the generated
+-- variant; pixels are recoverable since each client repaints from history
+-- it already has cached locally.
+do $$
+begin
+  if exists (
+    select 1
+    from pg_attribute a
+    join pg_class c on c.oid = a.attrelid
+    join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public'
+      and c.relname = 'pixels'
+      and a.attname = 'idx'
+      and a.attgenerated <> ''
+  ) then
+    drop table public.pixels cascade;
+  end if;
+end $$;
+
 create table if not exists public.pixels (
-  -- Composite-derived id lets us batch-delete by primary key.
-  -- Canvas is 4000x4000, so idx = x * 4000 + y is unique and fits in bigint.
-  idx        bigint generated always as ((x::bigint) * 4000 + y) stored primary key,
+  -- Client supplies idx = x * 4000 + y. The CHECK keeps the table consistent
+  -- regardless of who's writing.
+  idx        bigint primary key,
   x          int  not null check (x between 0 and 3999),
   y          int  not null check (y between 0 and 3999),
   color      text not null check (char_length(color) between 1 and 16),
   client_id  text not null,
   nickname   text not null check (char_length(nickname) between 1 and 32),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  constraint pixels_idx_matches_xy check (idx = (x::bigint) * 4000 + y)
 );
 
 create index if not exists pixels_client_id_idx  on public.pixels (client_id);

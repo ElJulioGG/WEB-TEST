@@ -31,6 +31,12 @@ interface PixelMeta {
   nickname: string
 }
 
+interface PixelChange {
+  idx: number
+  before: PixelMeta | null // null = pixel was empty (white) before
+  after: PixelMeta | null  // null = pixel is now empty
+}
+
 const PALETTE = [
   '#0f172a', '#ef4444', '#f97316', '#facc15',
   '#22c55e', '#0ea5e9', '#8b5cf6', '#ec4899',
@@ -51,6 +57,7 @@ const UPSERT_CHUNK = 1000
 const DELETE_CHUNK = 200
 // Stamp broadcasts use multi-color batches; same chunk size as upserts.
 const MULTI_BATCH_CHUNK = 2000
+const UNDO_LIMIT = 30
 
 function idxOf(x: number, y: number) {
   return x * CANVAS_SIZE + y
@@ -156,6 +163,8 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   const [stamp, setStampState] = useState<StampData | null>(null)
   const [stampSize, setStampSizeState] = useState<number>(128)
   const [stamping, setStamping] = useState(false)
+  const [undoCount, setUndoCount] = useState(0)
+  const [saving, setSaving] = useState(false)
 
   const colorRef = useRef(color)
   const widthRef = useRef(width)
@@ -180,6 +189,11 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   } | null>(null)
   // All pixels touched by the current stroke (deduped by idx). Persisted on stroke-end.
   const sessionDirtyRef = useRef<Map<number, { x: number; y: number; color: string | null }>>(new Map())
+  // Snapshot of attribution before the current stroke modified each pixel,
+  // used to build undo entries.
+  const sessionBeforeRef = useRef<Map<number, PixelMeta | null>>(new Map())
+  // Local-only undo stack of past stroke/stamp changes.
+  const undoStackRef = useRef<PixelChange[][]>([])
   const drawingRef = useRef(false)
   const lastPaintRef = useRef<{ x: number; y: number } | null>(null)
 
@@ -309,6 +323,35 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     attributionRef.current.delete(idxOf(x, y))
   }
 
+  // For local actions (paint/erase/stamp): record the pixel's prior state the
+  // first time it's touched in the current stroke, so we can undo later.
+  function capturePixelBefore(x: number, y: number) {
+    const key = idxOf(x, y)
+    const before = sessionBeforeRef.current
+    if (before.has(key)) return
+    const prev = attributionRef.current.get(key)
+    before.set(key, prev ? { ...prev } : null)
+  }
+
+  function commitUndoEntry() {
+    const before = sessionBeforeRef.current
+    if (before.size === 0) return
+    const entry: PixelChange[] = []
+    for (const [key, b] of before) {
+      const a = attributionRef.current.get(key)
+      // Skip pixels whose state is unchanged (e.g. you painted the same color
+      // they already had).
+      if (b && a && b.color === a.color && b.client_id === a.client_id) continue
+      if (!b && !a) continue
+      entry.push({ idx: key, before: b, after: a ? { ...a } : null })
+    }
+    sessionBeforeRef.current = new Map()
+    if (entry.length === 0) return
+    undoStackRef.current.push(entry)
+    while (undoStackRef.current.length > UNDO_LIMIT) undoStackRef.current.shift()
+    setUndoCount(undoStackRef.current.length)
+  }
+
   function applyBrush(
     cx: number,
     cy: number,
@@ -327,6 +370,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         const key = idxOf(px, py)
         if (dirty.has(key)) continue
         dirty.set(key, [px, py])
+        capturePixelBefore(px, py)
         if (isErase) erasePixelLocal(px, py)
         else paintPixelLocal(px, py, c, meta)
       }
@@ -392,6 +436,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     flushBatch()
     pendingRef.current = null
     lastPaintRef.current = null
+    commitUndoEntry()
     flushPersist()
   }
 
@@ -453,29 +498,35 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     const paints = items.filter((it) => it.color !== null)
     const erases = items.filter((it) => it.color === null)
 
-    for (let i = 0; i < paints.length; i += UPSERT_CHUNK) {
-      const slice = paints.slice(i, i + UPSERT_CHUNK)
-      const rows = slice.map((it) => ({
-        x: it.x,
-        y: it.y,
-        color: it.color as string,
-        client_id: clientId,
-        nickname,
-      }))
-      const { error: err } = await supabase.from('pixels').upsert(rows, { onConflict: 'idx' })
-      if (err) {
-        setError(err.message)
-        return
+    setSaving(true)
+    try {
+      for (let i = 0; i < paints.length; i += UPSERT_CHUNK) {
+        const slice = paints.slice(i, i + UPSERT_CHUNK)
+        const rows = slice.map((it) => ({
+          idx: idxOf(it.x, it.y),
+          x: it.x,
+          y: it.y,
+          color: it.color as string,
+          client_id: clientId,
+          nickname,
+        }))
+        const { error: err } = await supabase.from('pixels').upsert(rows, { onConflict: 'idx' })
+        if (err) {
+          setError(err.message)
+          return
+        }
       }
-    }
-    for (let i = 0; i < erases.length; i += DELETE_CHUNK) {
-      const slice = erases.slice(i, i + DELETE_CHUNK)
-      const ids = slice.map((it) => idxOf(it.x, it.y))
-      const { error: err } = await supabase.from('pixels').delete().in('idx', ids)
-      if (err) {
-        setError(err.message)
-        return
+      for (let i = 0; i < erases.length; i += DELETE_CHUNK) {
+        const slice = erases.slice(i, i + DELETE_CHUNK)
+        const ids = slice.map((it) => idxOf(it.x, it.y))
+        const { error: err } = await supabase.from('pixels').delete().in('idx', ids)
+        if (err) {
+          setError(err.message)
+          return
+        }
       }
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -694,6 +745,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
           const py = startY + iy
           if (!isInsideCanvas(px, py)) continue
           const c = rgbToHex(data[i], data[i + 1], data[i + 2])
+          capturePixelBefore(px, py)
           paintPixelLocal(px, py, c, meta)
           ops.push([px, py, c])
           dirty.set(idxOf(px, py), { x: px, y: py, color: c })
@@ -701,9 +753,11 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       }
       if (ops.length === 0) {
         setStamping(false)
+        sessionBeforeRef.current = new Map()
         return
       }
       requestRender()
+      commitUndoEntry()
 
       // Broadcast in chunks (multi-color batch).
       const ch = channelRef.current
@@ -868,6 +922,12 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         }
         return
       }
+      // Ctrl+Z / Cmd+Z = undo. Don't trigger redo on Ctrl+Shift+Z.
+      if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'z') {
+        e.preventDefault()
+        undo()
+        return
+      }
       if (e.key === '+' || e.key === '=') {
         e.preventDefault()
         zoomBy(1.2)
@@ -919,6 +979,10 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     }
     for (const key of toErase) erasePixelLocal(xFromIdx(key), yFromIdx(key))
     if (toErase.length > 0) requestRender()
+    // Clear-mine wipes the local undo stack — those changes are no longer
+    // reversible without a full reload from the server.
+    undoStackRef.current = []
+    setUndoCount(0)
     channelRef.current?.send({
       type: 'broadcast',
       event: 'clear-mine',
@@ -926,6 +990,102 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     })
     const { error: err } = await supabase.from('pixels').delete().eq('client_id', clientId)
     if (err) setError(err.message)
+  }
+
+  async function undo() {
+    const entry = undoStackRef.current.pop()
+    setUndoCount(undoStackRef.current.length)
+    if (!entry) return
+
+    const paintOps: [number, number, string][] = []
+    const eraseOps: [number, number][] = []
+    const upsertRows: Array<{
+      idx: number
+      x: number
+      y: number
+      color: string
+      client_id: string
+      nickname: string
+    }> = []
+    const deleteIds: number[] = []
+
+    for (const { idx: key, before } of entry) {
+      const x = xFromIdx(key)
+      const y = yFromIdx(key)
+      if (before) {
+        paintPixelLocal(x, y, before.color, {
+          client_id: before.client_id,
+          nickname: before.nickname,
+        })
+        paintOps.push([x, y, before.color])
+        upsertRows.push({
+          idx: key,
+          x,
+          y,
+          color: before.color,
+          // Restore the original author so the DB row keeps correct attribution.
+          client_id: before.client_id,
+          nickname: before.nickname,
+        })
+      } else {
+        erasePixelLocal(x, y)
+        eraseOps.push([x, y])
+        deleteIds.push(key)
+      }
+    }
+    requestRender()
+
+    const ch = channelRef.current
+    if (ch) {
+      for (let i = 0; i < paintOps.length; i += MULTI_BATCH_CHUNK) {
+        ch.send({
+          type: 'broadcast',
+          event: 'pixel-batch-multi',
+          payload: {
+            client_id: clientId,
+            nickname,
+            ops: paintOps.slice(i, i + MULTI_BATCH_CHUNK),
+          },
+        })
+      }
+      if (eraseOps.length > 0) {
+        for (let i = 0; i < eraseOps.length; i += MULTI_BATCH_CHUNK) {
+          ch.send({
+            type: 'broadcast',
+            event: 'pixel-batch',
+            payload: {
+              client_id: clientId,
+              nickname,
+              color: null,
+              ops: eraseOps.slice(i, i + MULTI_BATCH_CHUNK),
+            },
+          })
+        }
+      }
+    }
+
+    if (!supabase) return
+    setSaving(true)
+    try {
+      for (let i = 0; i < upsertRows.length; i += UPSERT_CHUNK) {
+        const slice = upsertRows.slice(i, i + UPSERT_CHUNK)
+        const { error: err } = await supabase.from('pixels').upsert(slice, { onConflict: 'idx' })
+        if (err) {
+          setError(err.message)
+          return
+        }
+      }
+      for (let i = 0; i < deleteIds.length; i += DELETE_CHUNK) {
+        const slice = deleteIds.slice(i, i + DELETE_CHUNK)
+        const { error: err } = await supabase.from('pixels').delete().in('idx', slice)
+        if (err) {
+          setError(err.message)
+          return
+        }
+      }
+    } finally {
+      setSaving(false)
+    }
   }
 
   const cursors = [...cursorsRef.current.values()]
@@ -1020,6 +1180,8 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
           onStampSize={setStampSize}
           onPickStamp={() => fileInputRef.current?.click()}
           onClearStamp={clearStamp}
+          canUndo={undoCount > 0}
+          onUndo={undo}
         />
       )}
 
@@ -1040,19 +1202,13 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       {/* Bottom hint */}
       {interactive && (
         <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] uppercase tracking-widest text-slate-500">
-          Lienzo {CANVAS_SIZE}×{CANVAS_SIZE} · B pintar · E borrar · S estampar · Rueda zoom · Espacio mueve · 0 ajusta
+          Lienzo {CANVAS_SIZE}×{CANVAS_SIZE} · B pintar · E borrar · S estampar · Ctrl+Z deshacer · Rueda zoom · Espacio mueve · 0 ajusta
         </div>
       )}
 
-      {stamping && (
+      {(stamping || loading || saving) && (
         <div className="pointer-events-none absolute right-4 top-20 rounded-lg border border-slate-300 bg-white/95 px-3 py-2 text-xs text-slate-700 shadow">
-          Estampando…
-        </div>
-      )}
-
-      {loading && (
-        <div className="pointer-events-none absolute right-4 top-20 rounded-lg border border-slate-300 bg-white/95 px-3 py-2 text-xs text-slate-700 shadow">
-          Cargando lienzo…
+          {stamping ? 'Estampando…' : loading ? 'Cargando lienzo…' : 'Guardando…'}
         </div>
       )}
 
@@ -1109,6 +1265,8 @@ interface ToolbarProps {
   onStampSize: (size: number) => void
   onPickStamp: () => void
   onClearStamp: () => void
+  canUndo: boolean
+  onUndo: () => void
 }
 
 function Toolbar({
@@ -1129,6 +1287,8 @@ function Toolbar({
   onStampSize,
   onPickStamp,
   onClearStamp,
+  canUndo,
+  onUndo,
 }: ToolbarProps) {
   const dimColors = tool !== 'paint'
   return (
@@ -1188,7 +1348,7 @@ function Toolbar({
             title="Estampar imagen (S)"
           >
             <span aria-hidden>🖼️</span>
-            <span>Estampar</span>
+            <span>Estampar imagen</span>
           </button>
         </div>
 
@@ -1292,6 +1452,16 @@ function Toolbar({
         </div>
 
         <div className="h-6 w-px bg-slate-200" />
+
+        <button
+          onClick={onUndo}
+          disabled={!canUndo}
+          className="flex items-center gap-1 rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+          title="Deshacer última acción (Ctrl+Z)"
+        >
+          <span aria-hidden>↶</span>
+          <span>Deshacer</span>
+        </button>
 
         <button
           onClick={onClearMine}
