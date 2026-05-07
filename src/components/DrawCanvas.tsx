@@ -165,6 +165,8 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   const [stamping, setStamping] = useState(false)
   const [undoCount, setUndoCount] = useState(0)
   const [saving, setSaving] = useState(false)
+  const [saveStats, setSaveStats] = useState<{ paints: number; erases: number; ts: number } | null>(null)
+  const [historyCount, setHistoryCount] = useState(0)
 
   const colorRef = useRef(color)
   const widthRef = useRef(width)
@@ -486,6 +488,40 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   }
 
   // ---- Persistence (chunked) --------------------------------------------
+  // Sort rows by `idx` so every client takes row locks in the same order —
+  // prevents deadlocks when two users upsert overlapping pixels at the same
+  // time. Retries the chunk once on serialization failures (40001) and
+  // deadlocks (40P01) before surfacing the error.
+  async function upsertWithRetry(
+    rows: Array<{ idx: number; x: number; y: number; color: string; client_id: string; nickname: string }>,
+  ): Promise<{ error: { message: string; code?: string } | null }> {
+    rows.sort((a, b) => a.idx - b.idx)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { error: err } = await supabase!
+        .from('pixels')
+        .upsert(rows, { onConflict: 'idx' })
+      if (!err) return { error: null }
+      const code = (err as { code?: string }).code
+      console.warn(`[draw] upsert attempt ${attempt + 1} failed:`, err.message, 'code=', code, err)
+      if (code !== '40001' && code !== '40P01') return { error: err }
+      await new Promise((r) => setTimeout(r, 100 * (attempt + 1)))
+    }
+    return { error: { message: 'upsert failed after retry', code: 'retry-exhausted' } }
+  }
+
+  async function deleteWithRetry(ids: number[]): Promise<{ error: { message: string; code?: string } | null }> {
+    ids.sort((a, b) => a - b)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { error: err } = await supabase!.from('pixels').delete().in('idx', ids)
+      if (!err) return { error: null }
+      const code = (err as { code?: string }).code
+      console.warn(`[draw] delete attempt ${attempt + 1} failed:`, err.message, 'code=', code, err)
+      if (code !== '40001' && code !== '40P01') return { error: err }
+      await new Promise((r) => setTimeout(r, 100 * (attempt + 1)))
+    }
+    return { error: { message: 'delete failed after retry', code: 'retry-exhausted' } }
+  }
+
   async function flushPersist() {
     if (!supabase) {
       sessionDirtyRef.current.clear()
@@ -499,6 +535,8 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     const erases = items.filter((it) => it.color === null)
 
     setSaving(true)
+    let savedPaints = 0
+    let savedErases = 0
     try {
       for (let i = 0; i < paints.length; i += UPSERT_CHUNK) {
         const slice = paints.slice(i, i + UPSERT_CHUNK)
@@ -510,20 +548,27 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
           client_id: clientId,
           nickname,
         }))
-        const { error: err } = await supabase.from('pixels').upsert(rows, { onConflict: 'idx' })
+        const { error: err } = await upsertWithRetry(rows)
         if (err) {
-          setError(err.message)
+          setError(`Upsert: ${err.message}${err.code ? ` (${err.code})` : ''}`)
+          console.error('[draw] flushPersist upsert failed; sample row:', rows[0])
           return
         }
+        savedPaints += rows.length
       }
       for (let i = 0; i < erases.length; i += DELETE_CHUNK) {
         const slice = erases.slice(i, i + DELETE_CHUNK)
         const ids = slice.map((it) => idxOf(it.x, it.y))
-        const { error: err } = await supabase.from('pixels').delete().in('idx', ids)
+        const { error: err } = await deleteWithRetry(ids)
         if (err) {
-          setError(err.message)
+          setError(`Delete: ${err.message}${err.code ? ` (${err.code})` : ''}`)
           return
         }
+        savedErases += ids.length
+      }
+      if (savedPaints + savedErases > 0) {
+        console.log(`[draw] persisted ${savedPaints} paints, ${savedErases} erases`)
+        setSaveStats({ paints: savedPaints, erases: savedErases, ts: Date.now() })
       }
     } finally {
       setSaving(false)
@@ -579,6 +624,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
 
     ;(async () => {
       let from = 0
+      let total = 0
       while (!cancelled) {
         const { data, error: err } = await supabase!
           .from('pixels')
@@ -587,17 +633,21 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
           .range(from, from + HISTORY_PAGE - 1)
         if (cancelled) return
         if (err) {
-          setError(err.message)
+          console.error('[draw] history load failed:', err.message, err)
+          setError(`No se pudo cargar el historial: ${err.message}`)
           break
         }
         if (!data || data.length === 0) break
         for (const row of data as { x: number; y: number; color: string; client_id: string; nickname: string }[]) {
           paintPixelLocal(row.x, row.y, row.color, { client_id: row.client_id, nickname: row.nickname })
         }
+        total += data.length
+        setHistoryCount(total)
         requestRender()
         if (data.length < HISTORY_PAGE) break
         from += data.length
       }
+      console.log(`[draw] history load complete: ${total} pixels`)
       if (!cancelled) setLoading(false)
     })()
 
@@ -660,6 +710,13 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       channelRef.current = null
     }
   }, [clientId])
+
+  // Auto-dismiss the save confirmation toast after a few seconds.
+  useEffect(() => {
+    if (!saveStats) return
+    const id = window.setTimeout(() => setSaveStats(null), 2500)
+    return () => window.clearTimeout(id)
+  }, [saveStats])
 
   // Sweep stale cursors
   useEffect(() => {
@@ -1069,17 +1126,17 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     try {
       for (let i = 0; i < upsertRows.length; i += UPSERT_CHUNK) {
         const slice = upsertRows.slice(i, i + UPSERT_CHUNK)
-        const { error: err } = await supabase.from('pixels').upsert(slice, { onConflict: 'idx' })
+        const { error: err } = await upsertWithRetry(slice)
         if (err) {
-          setError(err.message)
+          setError(`Undo upsert: ${err.message}${err.code ? ` (${err.code})` : ''}`)
           return
         }
       }
       for (let i = 0; i < deleteIds.length; i += DELETE_CHUNK) {
         const slice = deleteIds.slice(i, i + DELETE_CHUNK)
-        const { error: err } = await supabase.from('pixels').delete().in('idx', slice)
+        const { error: err } = await deleteWithRetry(slice)
         if (err) {
-          setError(err.message)
+          setError(`Undo delete: ${err.message}${err.code ? ` (${err.code})` : ''}`)
           return
         }
       }
@@ -1208,7 +1265,19 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
 
       {(stamping || loading || saving) && (
         <div className="pointer-events-none absolute right-4 top-20 rounded-lg border border-slate-300 bg-white/95 px-3 py-2 text-xs text-slate-700 shadow">
-          {stamping ? 'Estampando…' : loading ? 'Cargando lienzo…' : 'Guardando…'}
+          {stamping
+            ? 'Estampando…'
+            : loading
+              ? `Cargando lienzo… ${historyCount > 0 ? `(${historyCount.toLocaleString()} px)` : ''}`
+              : 'Guardando…'}
+        </div>
+      )}
+
+      {!stamping && !loading && !saving && saveStats && (
+        <div className="pointer-events-none absolute right-4 top-20 rounded-lg border border-emerald-300 bg-emerald-50/95 px-3 py-2 text-xs text-emerald-800 shadow">
+          ✓ Guardado: {saveStats.paints > 0 && `${saveStats.paints} px`}
+          {saveStats.paints > 0 && saveStats.erases > 0 && ', '}
+          {saveStats.erases > 0 && `${saveStats.erases} borrados`}
         </div>
       )}
 
@@ -1219,14 +1288,15 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         </div>
       )}
       {error && (
-        <div className="pointer-events-auto absolute left-4 top-20 max-w-xs rounded-lg border border-rose-300 bg-rose-50/95 px-3 py-2 text-xs text-rose-900 shadow">
-          {error}
+        <div className="pointer-events-auto absolute left-4 top-20 max-w-md rounded-lg border border-rose-300 bg-rose-50/95 px-3 py-2 text-xs text-rose-900 shadow">
+          <strong>Error de Supabase:</strong> {error}
           <button
             onClick={() => setError(null)}
             className="ml-2 rounded px-1 text-rose-700 hover:bg-rose-100"
           >
             ×
           </button>
+          <div className="mt-1 text-[10px] text-rose-700/80">Mirá la consola del navegador (F12) para más detalles.</div>
         </div>
       )}
     </div>

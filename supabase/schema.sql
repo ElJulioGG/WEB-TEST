@@ -64,23 +64,39 @@ drop table if exists public.strokes cascade;
 
 -- An earlier version of the schema used a STORED GENERATED column for idx.
 -- That breaks PostgREST upserts in some configs because the conflict-target
--- column can't be sent in the insert payload. We now compute idx on the
--- client and just enforce it with a CHECK constraint, so the upsert payload
--- is fully self-contained. Drop the old table if it still has the generated
--- variant; pixels are recoverable since each client repaints from history
--- it already has cached locally.
+-- column cannot appear in the insert payload, so writes silently fail and
+-- the canvas seems to "reset" on reload. We now compute idx on the client
+-- and enforce it with a CHECK constraint, so the upsert payload is fully
+-- self-contained.
+--
+-- The migration below drops the old table if it exists but does NOT match
+-- the new shape (i.e. `idx` is generated, or our CHECK constraint is
+-- missing). Existing painted pixels are recoverable from each client's
+-- in-memory cache or via a manual `pg_dump` if you need them.
+--
+-- IMPORTANT: close every browser tab that has the whiteboard open before
+-- running this script. Active SELECTs/INSERTs against pixels can deadlock
+-- with the DROP TABLE.
 do $$
 begin
-  if exists (
-    select 1
-    from pg_attribute a
-    join pg_class c on c.oid = a.attrelid
-    join pg_namespace n on n.oid = c.relnamespace
-    where n.nspname = 'public'
-      and c.relname = 'pixels'
-      and a.attname = 'idx'
-      and a.attgenerated <> ''
-  ) then
+  if exists (select 1 from information_schema.tables
+             where table_schema = 'public' and table_name = 'pixels')
+     and (
+       -- old generated-column variant
+       exists (
+         select 1 from pg_attribute a
+         join pg_class c on c.oid = a.attrelid
+         join pg_namespace n on n.oid = c.relnamespace
+         where n.nspname = 'public' and c.relname = 'pixels'
+           and a.attname = 'idx' and a.attgenerated <> ''
+       )
+       -- or missing the new CHECK that proves we're on the latest shape
+       or not exists (
+         select 1 from pg_constraint
+         where conname = 'pixels_idx_matches_xy'
+       )
+     )
+  then
     drop table public.pixels cascade;
   end if;
 end $$;
