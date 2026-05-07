@@ -56,68 +56,51 @@ end $$;
 
 
 -- ============================================================================
--- Whiteboard strokes (collaborative drawing canvas)
+-- Pixels (collaborative pixel canvas, one row per painted cell)
 -- ============================================================================
+-- The legacy stroke-based whiteboard is replaced by a per-pixel canvas, so we
+-- drop the old table if it still exists.
+drop table if exists public.strokes cascade;
 
-create table if not exists public.strokes (
-  id         uuid primary key,
+create table if not exists public.pixels (
+  -- Composite-derived id lets us batch-delete by primary key.
+  -- Canvas is 4000x4000, so idx = x * 4000 + y is unique and fits in bigint.
+  idx        bigint generated always as ((x::bigint) * 4000 + y) stored primary key,
+  x          int  not null check (x between 0 and 3999),
+  y          int  not null check (y between 0 and 3999),
+  color      text not null check (char_length(color) between 1 and 16),
   client_id  text not null,
   nickname   text not null check (char_length(nickname) between 1 and 32),
-  color      text not null check (char_length(color) between 1 and 16),
-  width      real not null check (width > 0 and width < 200),
-  points     jsonb not null,
-  created_at timestamptz not null default now()
+  updated_at timestamptz not null default now()
 );
 
-create index if not exists strokes_created_at_idx on public.strokes (created_at desc);
-create index if not exists strokes_client_id_idx  on public.strokes (client_id);
+create index if not exists pixels_client_id_idx  on public.pixels (client_id);
+create index if not exists pixels_updated_at_idx on public.pixels (updated_at desc);
 
-alter table public.strokes enable row level security;
+alter table public.pixels enable row level security;
 
-drop policy if exists "read strokes" on public.strokes;
-create policy "read strokes" on public.strokes
+drop policy if exists "read pixels" on public.pixels;
+create policy "read pixels" on public.pixels
   for select using (true);
 
-drop policy if exists "insert strokes" on public.strokes;
-create policy "insert strokes" on public.strokes
+drop policy if exists "insert pixels" on public.pixels;
+create policy "insert pixels" on public.pixels
   for insert with check (
     char_length(nickname) between 1 and 32
     and char_length(color) between 1 and 16
   );
 
-drop policy if exists "delete strokes" on public.strokes;
-create policy "delete strokes" on public.strokes
+drop policy if exists "update pixels" on public.pixels;
+create policy "update pixels" on public.pixels
+  for update using (true) with check (
+    char_length(nickname) between 1 and 32
+    and char_length(color) between 1 and 16
+  );
+
+drop policy if exists "delete pixels" on public.pixels;
+create policy "delete pixels" on public.pixels
   for delete using (true);
 
--- Keep the most recent ~5000 strokes (auto-prune on insert).
-create or replace function public.prune_strokes() returns trigger as $$
-begin
-  delete from public.strokes
-  where id in (
-    select id from public.strokes
-    order by created_at desc
-    offset 5000
-  );
-  return null;
-end;
-$$ language plpgsql;
-
-drop trigger if exists prune_strokes_trigger on public.strokes;
-create trigger prune_strokes_trigger
-  after insert on public.strokes
-  for each statement execute function public.prune_strokes();
-
--- Make DELETE events deliver the row id via realtime.
-alter table public.strokes replica identity full;
-
-do $$
-begin
-  if not exists (
-    select 1 from pg_publication_tables
-    where pubname = 'supabase_realtime'
-      and schemaname = 'public'
-      and tablename = 'strokes'
-  ) then
-    alter publication supabase_realtime add table public.strokes;
-  end if;
-end $$;
+-- We do not add public.pixels to supabase_realtime: realtime sync uses
+-- broadcast on the client (per-stroke batches), and the table is queried only
+-- for history on join. Adding it to the publication would multiply egress.

@@ -3,15 +3,7 @@ import type { RealtimeChannel } from '@supabase/supabase-js'
 import { supabase, chatEnabled } from '../lib/supabase'
 
 interface Point { x: number; y: number }
-
-export interface Stroke {
-  id: string
-  client_id: string
-  nickname: string
-  color: string
-  width: number
-  points: Point[]
-}
+type Tool = 'paint' | 'erase'
 
 interface Cursor {
   client_id: string
@@ -23,28 +15,45 @@ interface Cursor {
   updatedAt: number
 }
 
+interface PixelMeta {
+  color: string
+  client_id: string
+  nickname: string
+}
+
 const PALETTE = [
   '#0f172a', '#ef4444', '#f97316', '#facc15',
   '#22c55e', '#0ea5e9', '#8b5cf6', '#ec4899',
 ]
-const SIZES = [2, 4, 8, 16]
-const HISTORY_LIMIT = 1000
+const SIZES = [1, 2, 4, 8]
 const CURSOR_TTL_MS = 5000
-// The shared drawing surface is a fixed-size page in world coordinates.
-// Everyone shares the same (0,0)..(CANVAS_SIZE,CANVAS_SIZE) plane.
 const CANVAS_SIZE = 4000
 const ZOOM_MIN = 0.05
-const ZOOM_MAX = 8
+const ZOOM_MAX = 32
+const HISTORY_PAGE = 5000
+// Realtime pacing
+const BATCH_INTERVAL_MS = 50
+const CURSOR_INTERVAL_MS = 35
+// DB chunking
+const UPSERT_CHUNK = 1000
+const DELETE_CHUNK = 200
 
-function clampToCanvas(p: Point): Point {
-  return {
-    x: Math.max(0, Math.min(CANVAS_SIZE, p.x)),
-    y: Math.max(0, Math.min(CANVAS_SIZE, p.y)),
-  }
+function idxOf(x: number, y: number) {
+  return x * CANVAS_SIZE + y
 }
-
-function isInsideCanvas(p: Point): boolean {
-  return p.x >= 0 && p.x <= CANVAS_SIZE && p.y >= 0 && p.y <= CANVAS_SIZE
+function xFromIdx(i: number) {
+  return Math.floor(i / CANVAS_SIZE)
+}
+function yFromIdx(i: number) {
+  return i - Math.floor(i / CANVAS_SIZE) * CANVAS_SIZE
+}
+function clampPx(v: number) {
+  if (v < 0) return 0
+  if (v >= CANVAS_SIZE) return CANVAS_SIZE - 1
+  return Math.floor(v)
+}
+function isInsideCanvas(x: number, y: number) {
+  return x >= 0 && x < CANVAS_SIZE && y >= 0 && y < CANVAS_SIZE
 }
 
 function stableColor(seed: string) {
@@ -75,38 +84,59 @@ interface Props {
 export function DrawCanvas({ nickname, interactive = true }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
+  const offscreenRef = useRef<HTMLCanvasElement | null>(null)
 
   const clientId = useMemo(() => genClientId(), [])
   const myColor = useMemo(() => stableColor(clientId), [clientId])
 
-  const [color, setColor] = useState<string>(myColor)
-  const [width, setWidthState] = useState<number>(4)
+  const [color, setColor] = useState<string>('#0f172a')
+  const [tool, setTool] = useState<Tool>('paint')
+  const [width, setWidthState] = useState<number>(2)
   const [zoom, setZoomState] = useState<number>(1)
   const [pan, setPanState] = useState<Point>({ x: 0, y: 0 })
-  const [hover, setHover] = useState<{ stroke: Stroke; sx: number; sy: number } | null>(null)
+  const [hover, setHover] = useState<{ meta: PixelMeta; x: number; y: number; sx: number; sy: number } | null>(null)
   const [, setCursorTick] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [spaceDown, setSpaceDownState] = useState(false)
+  const [loading, setLoading] = useState(false)
 
-  // refs that mirror state for use inside event handlers / RAF loop
   const colorRef = useRef(color)
   const widthRef = useRef(width)
+  const toolRef = useRef(tool)
   const zoomRef = useRef(zoom)
   const panRef = useRef(pan)
   const spaceDownRef = useRef(false)
   const interactiveRef = useRef(interactive)
 
+  // Pixel attribution: idx -> {color, client_id, nickname}
+  const attributionRef = useRef<Map<number, PixelMeta>>(new Map())
+  // Pixels affected by the in-flight stroke that haven't been broadcast yet.
+  const pendingRef = useRef<{
+    color: string | null // null = erase
+    pixels: Map<number, [number, number]>
+  } | null>(null)
+  // All pixels touched by the current stroke (deduped by idx). Persisted on stroke-end.
+  const sessionDirtyRef = useRef<Map<number, { x: number; y: number; color: string | null }>>(new Map())
+  const drawingRef = useRef(false)
+  const lastPaintRef = useRef<{ x: number; y: number } | null>(null)
+
+  const cursorsRef = useRef<Map<string, Cursor>>(new Map())
+  const channelRef = useRef<RealtimeChannel | null>(null)
+  const lastCursorBroadcast = useRef(0)
+  const lastBatchBroadcast = useRef(0)
+
+  const sizeRef = useRef({ w: 0, h: 0, dpr: 1 })
+  const renderPendingRef = useRef(false)
+  const panStateRef = useRef<{ active: boolean; sx: number; sy: number; startPan: Point } | null>(null)
+  const fittedRef = useRef(false)
+
   useEffect(() => { colorRef.current = color }, [color])
   useEffect(() => { widthRef.current = width }, [width])
+  useEffect(() => { toolRef.current = tool }, [tool])
   useEffect(() => {
     interactiveRef.current = interactive
     if (!interactive) {
-      // Cancel any in-flight stroke when leaving draw mode.
-      if (myStrokeRef.current) {
-        myStrokeRef.current = null
-        broadcastEnd()
-        requestRender()
-      }
+      if (drawingRef.current) endStroke()
       spaceDownRef.current = false
       setSpaceDownState(false)
       panStateRef.current = null
@@ -114,20 +144,18 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interactive])
 
-  // Drawing/transport state held in refs (no React re-renders).
-  const strokesRef = useRef<Stroke[]>([])
-  const liveStrokesRef = useRef<Map<string, Stroke>>(new Map())
-  const myStrokeRef = useRef<Stroke | null>(null)
-  const cursorsRef = useRef<Map<string, Cursor>>(new Map())
+  // Init the offscreen 4000x4000 raster used as the source-of-truth.
+  useEffect(() => {
+    const c = document.createElement('canvas')
+    c.width = CANVAS_SIZE
+    c.height = CANVAS_SIZE
+    offscreenRef.current = c
+    requestRender()
+  }, [])
 
-  const channelRef = useRef<RealtimeChannel | null>(null)
-  const lastCursorBroadcast = useRef(0)
-  const lastProgressBroadcast = useRef(0)
-
-  const sizeRef = useRef({ w: 0, h: 0, dpr: 1 })
-  const renderPendingRef = useRef(false)
-  const panStateRef = useRef<{ active: boolean; sx: number; sy: number; startPan: Point } | null>(null)
-  const fittedRef = useRef(false)
+  function getOffCtx(): CanvasRenderingContext2D | null {
+    return offscreenRef.current?.getContext('2d') ?? null
+  }
 
   function setZoom(v: number) {
     zoomRef.current = v
@@ -156,56 +184,220 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     if (!canvas) return
     const ctx = canvas.getContext('2d')
     if (!ctx) return
+    const off = offscreenRef.current
     const { w, h, dpr } = sizeRef.current
 
-    // Background outside the page (so the canvas boundary is visible).
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-    ctx.fillStyle = '#e2e8f0' // slate-200
+    ctx.fillStyle = '#e2e8f0'
     ctx.fillRect(0, 0, w, h)
 
     const z = zoomRef.current
     const p = panRef.current
     ctx.setTransform(dpr * z, 0, 0, dpr * z, dpr * -p.x * z, dpr * -p.y * z)
 
-    // The fixed 4000x4000 white page that everyone shares.
+    // Always paint the white page underneath so erased pixels reveal white.
     ctx.fillStyle = '#ffffff'
     ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE)
+
+    if (off) {
+      // Crisp pixels when zoomed in; smooth resampling when zoomed out.
+      ctx.imageSmoothingEnabled = z < 1
+      ctx.drawImage(off, 0, 0)
+    }
+
+    ctx.imageSmoothingEnabled = true
     ctx.strokeStyle = 'rgba(15, 23, 42, 0.25)'
     ctx.lineWidth = Math.max(1 / z, 0.5)
     ctx.strokeRect(0, 0, CANVAS_SIZE, CANVAS_SIZE)
-
-    // Strokes are confined to the page.
-    ctx.save()
-    ctx.beginPath()
-    ctx.rect(0, 0, CANVAS_SIZE, CANVAS_SIZE)
-    ctx.clip()
-    for (const s of strokesRef.current) drawStroke(ctx, s)
-    for (const s of liveStrokesRef.current.values()) drawStroke(ctx, s)
-    if (myStrokeRef.current) drawStroke(ctx, myStrokeRef.current)
-    ctx.restore()
   }
 
-  function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke) {
-    const pts = s.points
-    if (pts.length === 0) return
-    ctx.strokeStyle = s.color
-    ctx.fillStyle = s.color
-    ctx.lineWidth = s.width
-    ctx.lineCap = 'round'
-    ctx.lineJoin = 'round'
-    if (pts.length === 1) {
-      ctx.beginPath()
-      ctx.arc(pts[0].x, pts[0].y, s.width / 2, 0, Math.PI * 2)
-      ctx.fill()
+  // ---- Pixel ops ---------------------------------------------------------
+  function paintPixelLocal(x: number, y: number, c: string, meta: { client_id: string; nickname: string }) {
+    const ctx = getOffCtx()
+    if (!ctx) return
+    ctx.fillStyle = c
+    ctx.fillRect(x, y, 1, 1)
+    attributionRef.current.set(idxOf(x, y), { color: c, client_id: meta.client_id, nickname: meta.nickname })
+  }
+
+  function erasePixelLocal(x: number, y: number) {
+    const ctx = getOffCtx()
+    if (!ctx) return
+    ctx.clearRect(x, y, 1, 1)
+    attributionRef.current.delete(idxOf(x, y))
+  }
+
+  function applyBrush(
+    cx: number,
+    cy: number,
+    isErase: boolean,
+    c: string,
+    meta: { client_id: string; nickname: string },
+    dirty: Map<number, [number, number]>,
+  ) {
+    const w = widthRef.current
+    const half = Math.floor(w / 2)
+    for (let dy = 0; dy < w; dy++) {
+      for (let dx = 0; dx < w; dx++) {
+        const px = cx - half + dx
+        const py = cy - half + dy
+        if (!isInsideCanvas(px, py)) continue
+        const key = idxOf(px, py)
+        if (dirty.has(key)) continue
+        dirty.set(key, [px, py])
+        if (isErase) erasePixelLocal(px, py)
+        else paintPixelLocal(px, py, c, meta)
+      }
+    }
+  }
+
+  function* linePoints(x0: number, y0: number, x1: number, y1: number): Generator<[number, number]> {
+    let cx = x0, cy = y0
+    const dx = Math.abs(x1 - cx)
+    const dy = -Math.abs(y1 - cy)
+    const sx = cx < x1 ? 1 : -1
+    const sy = cy < y1 ? 1 : -1
+    let err = dx + dy
+    // Safety bound: 4000+4000 = 8000 max steps.
+    for (let i = 0; i <= 8200; i++) {
+      yield [cx, cy]
+      if (cx === x1 && cy === y1) return
+      const e2 = 2 * err
+      if (e2 >= dy) { err += dy; cx += sx }
+      if (e2 <= dx) { err += dx; cy += sy }
+    }
+  }
+
+  function paintAt(cx: number, cy: number) {
+    const pending = pendingRef.current
+    if (!pending) return
+    const isErase = toolRef.current === 'erase'
+    const c = colorRef.current
+    const meta = { client_id: clientId, nickname }
+
+    const last = lastPaintRef.current
+    if (last) {
+      for (const [x, y] of linePoints(last.x, last.y, cx, cy)) {
+        applyBrush(x, y, isErase, c, meta, pending.pixels)
+      }
+    } else {
+      applyBrush(cx, cy, isErase, c, meta, pending.pixels)
+    }
+    lastPaintRef.current = { x: cx, y: cy }
+
+    // Mirror to the session-dirty set for end-of-stroke persistence.
+    for (const [key, [x, y]] of pending.pixels) {
+      sessionDirtyRef.current.set(key, { x, y, color: isErase ? null : c })
+    }
+
+    requestRender()
+    maybeBroadcastBatch()
+  }
+
+  function startStroke(cx: number, cy: number) {
+    drawingRef.current = true
+    pendingRef.current = {
+      color: toolRef.current === 'erase' ? null : colorRef.current,
+      pixels: new Map(),
+    }
+    lastPaintRef.current = null
+    paintAt(cx, cy)
+  }
+
+  function endStroke() {
+    if (!drawingRef.current) return
+    drawingRef.current = false
+    flushBatch()
+    pendingRef.current = null
+    lastPaintRef.current = null
+    flushPersist()
+  }
+
+  // ---- Realtime broadcast ------------------------------------------------
+  function maybeBroadcastBatch() {
+    const now = performance.now()
+    if (now - lastBatchBroadcast.current < BATCH_INTERVAL_MS) return
+    flushBatch()
+  }
+
+  function flushBatch() {
+    const ch = channelRef.current
+    const pending = pendingRef.current
+    if (!ch || !pending || pending.pixels.size === 0) return
+    lastBatchBroadcast.current = performance.now()
+    const ops = Array.from(pending.pixels.values())
+    pending.pixels.clear()
+    ch.send({
+      type: 'broadcast',
+      event: 'pixel-batch',
+      payload: {
+        client_id: clientId,
+        nickname,
+        color: pending.color, // null means erase
+        ops,
+      },
+    })
+  }
+
+  function broadcastCursor(world: Point, drawing: boolean, force = false) {
+    if (!channelRef.current) return
+    const now = performance.now()
+    if (!force && now - lastCursorBroadcast.current < CURSOR_INTERVAL_MS) return
+    lastCursorBroadcast.current = now
+    channelRef.current.send({
+      type: 'broadcast',
+      event: 'cursor',
+      payload: {
+        client_id: clientId,
+        nickname,
+        color: myColor,
+        x: world.x,
+        y: world.y,
+        drawing,
+      },
+    })
+  }
+
+  // ---- Persistence (chunked) --------------------------------------------
+  async function flushPersist() {
+    if (!supabase) {
+      sessionDirtyRef.current.clear()
       return
     }
-    ctx.beginPath()
-    ctx.moveTo(pts[0].x, pts[0].y)
-    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y)
-    ctx.stroke()
+    const items = Array.from(sessionDirtyRef.current.values())
+    sessionDirtyRef.current = new Map()
+    if (items.length === 0) return
+
+    const paints = items.filter((it) => it.color !== null)
+    const erases = items.filter((it) => it.color === null)
+
+    for (let i = 0; i < paints.length; i += UPSERT_CHUNK) {
+      const slice = paints.slice(i, i + UPSERT_CHUNK)
+      const rows = slice.map((it) => ({
+        x: it.x,
+        y: it.y,
+        color: it.color as string,
+        client_id: clientId,
+        nickname,
+      }))
+      const { error: err } = await supabase.from('pixels').upsert(rows, { onConflict: 'idx' })
+      if (err) {
+        setError(err.message)
+        return
+      }
+    }
+    for (let i = 0; i < erases.length; i += DELETE_CHUNK) {
+      const slice = erases.slice(i, i + DELETE_CHUNK)
+      const ids = slice.map((it) => idxOf(it.x, it.y))
+      const { error: err } = await supabase.from('pixels').delete().in('idx', ids)
+      if (err) {
+        setError(err.message)
+        return
+      }
+    }
   }
 
-  // Resize observer keeps canvas in sync with container size and DPR.
+  // ---- Resize / fit ------------------------------------------------------
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return
     const container = containerRef.current
@@ -220,7 +412,6 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       canvas.style.width = w + 'px'
       canvas.style.height = h + 'px'
       sizeRef.current = { w, h, dpr }
-      // Auto-fit the 4000x4000 page into the viewport on first valid size.
       if (!fittedRef.current && w > 0 && h > 0) {
         fittedRef.current = true
         fitToScreen()
@@ -241,7 +432,6 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     const fit = Math.min((w - padding) / CANVAS_SIZE, (h - padding) / CANVAS_SIZE)
     const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, fit))
     setZoom(next)
-    // Center the page in the viewport.
     setPan({
       x: -(w - CANVAS_SIZE * next) / 2 / next,
       y: -(h - CANVAS_SIZE * next) / 2 / next,
@@ -249,52 +439,38 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     requestRender()
   }
 
-  // Supabase: load history, subscribe to realtime channel.
+  // ---- History load + realtime subscribe --------------------------------
   useEffect(() => {
     if (!supabase) return
     let cancelled = false
+    setLoading(true)
 
-    supabase
-      .from('strokes')
-      .select('id, client_id, nickname, color, width, points')
-      .order('created_at', { ascending: false })
-      .limit(HISTORY_LIMIT)
-      .then(({ data, error: err }) => {
+    ;(async () => {
+      let from = 0
+      while (!cancelled) {
+        const { data, error: err } = await supabase!
+          .from('pixels')
+          .select('x, y, color, client_id, nickname')
+          .order('idx', { ascending: true })
+          .range(from, from + HISTORY_PAGE - 1)
         if (cancelled) return
         if (err) {
           setError(err.message)
-          return
+          break
         }
-        if (data) {
-          strokesRef.current = (data as Stroke[]).reverse()
-          requestRender()
+        if (!data || data.length === 0) break
+        for (const row of data as { x: number; y: number; color: string; client_id: string; nickname: string }[]) {
+          paintPixelLocal(row.x, row.y, row.color, { client_id: row.client_id, nickname: row.nickname })
         }
-      })
+        requestRender()
+        if (data.length < HISTORY_PAGE) break
+        from += data.length
+      }
+      if (!cancelled) setLoading(false)
+    })()
 
     const ch = supabase
       .channel('whiteboard', { config: { broadcast: { self: false } } })
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'strokes' },
-        (payload) => {
-          const s = payload.new as Stroke
-          if (s.client_id === clientId) return
-          liveStrokesRef.current.delete(s.client_id)
-          strokesRef.current.push(s)
-          if (strokesRef.current.length > HISTORY_LIMIT) strokesRef.current.shift()
-          requestRender()
-        },
-      )
-      .on(
-        'postgres_changes',
-        { event: 'DELETE', schema: 'public', table: 'strokes' },
-        (payload) => {
-          const oldId = (payload.old as { id?: string })?.id
-          if (!oldId) return
-          strokesRef.current = strokesRef.current.filter((s) => s.id !== oldId)
-          requestRender()
-        },
-      )
       .on('broadcast', { event: 'cursor' }, ({ payload }) => {
         if (!payload || payload.client_id === clientId) return
         cursorsRef.current.set(payload.client_id, {
@@ -308,21 +484,29 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         })
         setCursorTick((t) => t + 1)
       })
-      .on('broadcast', { event: 'stroke-progress' }, ({ payload }) => {
+      .on('broadcast', { event: 'pixel-batch' }, ({ payload }) => {
         if (!payload || payload.client_id === clientId) return
-        liveStrokesRef.current.set(payload.client_id, payload as Stroke)
-        requestRender()
-      })
-      .on('broadcast', { event: 'stroke-end' }, ({ payload }) => {
-        if (!payload) return
-        liveStrokesRef.current.delete(payload.client_id)
+        const c: string | null = payload.color
+        const ops = payload.ops as [number, number][] | undefined
+        if (!ops || ops.length === 0) return
+        const isErase = c === null
+        const meta = { client_id: payload.client_id, nickname: payload.nickname }
+        for (const [x, y] of ops) {
+          if (!isInsideCanvas(x, y)) continue
+          if (isErase) erasePixelLocal(x, y)
+          else paintPixelLocal(x, y, c as string, meta)
+        }
         requestRender()
       })
       .on('broadcast', { event: 'clear-mine' }, ({ payload }) => {
-        if (!payload?.client_id) return
-        strokesRef.current = strokesRef.current.filter((s) => s.client_id !== payload.client_id)
-        liveStrokesRef.current.delete(payload.client_id)
-        requestRender()
+        const cid = payload?.client_id
+        if (!cid) return
+        const toErase: number[] = []
+        for (const [key, meta] of attributionRef.current) {
+          if (meta.client_id === cid) toErase.push(key)
+        }
+        for (const key of toErase) erasePixelLocal(xFromIdx(key), yFromIdx(key))
+        if (toErase.length > 0) requestRender()
       })
       .subscribe()
     channelRef.current = ch
@@ -334,7 +518,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     }
   }, [clientId])
 
-  // Sweep stale cursors.
+  // Sweep stale cursors
   useEffect(() => {
     const id = window.setInterval(() => {
       const now = Date.now()
@@ -361,46 +545,6 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     return { x: (p.x - pn.x) * z, y: (p.y - pn.y) * z }
   }
 
-  function broadcastCursor(world: Point, drawing: boolean, force = false) {
-    if (!channelRef.current) return
-    const now = performance.now()
-    if (!force && now - lastCursorBroadcast.current < 35) return
-    lastCursorBroadcast.current = now
-    channelRef.current.send({
-      type: 'broadcast',
-      event: 'cursor',
-      payload: {
-        client_id: clientId,
-        nickname,
-        color: myColor,
-        x: world.x,
-        y: world.y,
-        drawing,
-      },
-    })
-  }
-
-  function broadcastProgress(force = false) {
-    if (!channelRef.current || !myStrokeRef.current) return
-    const now = performance.now()
-    if (!force && now - lastProgressBroadcast.current < 60) return
-    lastProgressBroadcast.current = now
-    channelRef.current.send({
-      type: 'broadcast',
-      event: 'stroke-progress',
-      payload: { ...myStrokeRef.current },
-    })
-  }
-
-  function broadcastEnd() {
-    if (!channelRef.current) return
-    channelRef.current.send({
-      type: 'broadcast',
-      event: 'stroke-end',
-      payload: { client_id: clientId },
-    })
-  }
-
   function startPan(sx: number, sy: number, target: HTMLElement, pointerId: number) {
     panStateRef.current = { active: true, sx, sy, startPan: { ...panRef.current } }
     try { target.setPointerCapture(pointerId) } catch { /* noop */ }
@@ -421,23 +565,13 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     if (e.button !== 0) return
 
     const world = screenToWorld(sx, sy)
-    // Don't start a stroke if the click is outside the bounded page.
-    if (!isInsideCanvas(world)) {
+    if (!isInsideCanvas(world.x, world.y)) {
       broadcastCursor(world, false, true)
       return
     }
-    myStrokeRef.current = {
-      id: newId(),
-      client_id: clientId,
-      nickname,
-      color: colorRef.current,
-      width: widthRef.current,
-      points: [clampToCanvas(world)],
-    }
     setHover(null)
     try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* noop */ }
-    requestRender()
-    broadcastProgress(true)
+    startStroke(clampPx(world.x), clampPx(world.y))
     broadcastCursor(world, true, true)
   }
 
@@ -461,27 +595,31 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
 
     const world = screenToWorld(sx, sy)
 
-    if (myStrokeRef.current) {
-      const next = clampToCanvas(world)
-      const last = myStrokeRef.current.points[myStrokeRef.current.points.length - 1]
-      const minStep = 0.5 / zoomRef.current
-      if (Math.abs(last.x - next.x) > minStep || Math.abs(last.y - next.y) > minStep) {
-        myStrokeRef.current.points.push(next)
-        requestRender()
-        broadcastProgress()
+    if (drawingRef.current) {
+      if (isInsideCanvas(world.x, world.y)) {
+        paintAt(clampPx(world.x), clampPx(world.y))
+      } else {
+        // Out of canvas: keep stroke alive but skip this point.
       }
       broadcastCursor(world, true)
       return
     }
 
     broadcastCursor(world, false)
-    const hit = hitTestStroke(sx, sy)
-    if (hit) {
-      setHover((prev) =>
-        prev && prev.stroke.id === hit.id && prev.sx === sx && prev.sy === sy
-          ? prev
-          : { stroke: hit, sx, sy },
-      )
+
+    // Hover attribution: show who painted the pixel under the cursor.
+    const hx = Math.floor(world.x)
+    const hy = Math.floor(world.y)
+    if (isInsideCanvas(hx, hy)) {
+      const meta = attributionRef.current.get(idxOf(hx, hy))
+      if (meta) {
+        setHover((prev) => {
+          if (prev && prev.x === hx && prev.y === hy) return { ...prev, sx, sy }
+          return { meta, x: hx, y: hy, sx, sy }
+        })
+      } else if (hover) {
+        setHover(null)
+      }
     } else if (hover) {
       setHover(null)
     }
@@ -493,33 +631,10 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       try { (e.target as HTMLElement).releasePointerCapture(e.pointerId) } catch { /* noop */ }
       return
     }
-    const stroke = myStrokeRef.current
-    if (!stroke) return
-    myStrokeRef.current = null
-    strokesRef.current.push(stroke)
-    if (strokesRef.current.length > HISTORY_LIMIT) strokesRef.current.shift()
-    requestRender()
-    broadcastEnd()
-
-    if (supabase) {
-      supabase
-        .from('strokes')
-        .insert({
-          id: stroke.id,
-          client_id: stroke.client_id,
-          nickname: stroke.nickname,
-          color: stroke.color,
-          width: stroke.width,
-          points: stroke.points,
-        })
-        .then(({ error: err }) => {
-          if (err) {
-            setError(err.message)
-            console.warn('stroke insert failed:', err.message)
-          }
-        })
+    if (drawingRef.current) {
+      endStroke()
+      try { (e.target as HTMLElement).releasePointerCapture(e.pointerId) } catch { /* noop */ }
     }
-    try { (e.target as HTMLElement).releasePointerCapture(e.pointerId) } catch { /* noop */ }
   }
 
   function onWheel(e: React.WheelEvent) {
@@ -536,47 +651,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     requestRender()
   }
 
-  function hitTestStroke(sx: number, sy: number): Stroke | null {
-    const world = screenToWorld(sx, sy)
-    const tol = 4 / zoomRef.current
-    for (let i = strokesRef.current.length - 1; i >= 0; i--) {
-      const s = strokesRef.current[i]
-      const r = s.width / 2 + tol
-      const r2 = r * r
-      const pts = s.points
-      if (pts.length === 1) {
-        const dx = pts[0].x - world.x
-        const dy = pts[0].y - world.y
-        if (dx * dx + dy * dy <= r2) return s
-        continue
-      }
-      for (let j = 0; j < pts.length - 1; j++) {
-        if (segDist2(pts[j], pts[j + 1], world) <= r2) return s
-      }
-    }
-    return null
-  }
-
-  function segDist2(a: Point, b: Point, p: Point) {
-    const dx = b.x - a.x
-    const dy = b.y - a.y
-    const len2 = dx * dx + dy * dy
-    if (len2 === 0) {
-      const ex = p.x - a.x
-      const ey = p.y - a.y
-      return ex * ex + ey * ey
-    }
-    let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2
-    if (t < 0) t = 0
-    else if (t > 1) t = 1
-    const cx = a.x + t * dx
-    const cy = a.y + t * dy
-    const ex = p.x - cx
-    const ey = p.y - cy
-    return ex * ex + ey * ey
-  }
-
-  // Keyboard: space-to-pan, +/- zoom, 0 reset.
+  // Keyboard: space=pan, +/- zoom, 0 fit, e=erase, b=paint
   useEffect(() => {
     function isTyping(t: EventTarget | null) {
       const el = t as HTMLElement | null
@@ -601,7 +676,11 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         zoomBy(1 / 1.2)
       } else if (e.key === '0') {
         e.preventDefault()
-        resetView()
+        fitToScreen()
+      } else if (e.key.toLowerCase() === 'e') {
+        setTool('erase')
+      } else if (e.key.toLowerCase() === 'b') {
+        setTool('paint')
       }
     }
     function up(e: KeyboardEvent) {
@@ -629,21 +708,21 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     requestRender()
   }
 
-  function resetView() {
-    fitToScreen()
-  }
-
   async function clearMine() {
     if (!supabase) return
-    if (!window.confirm('¿Borrar todos tus trazos?')) return
-    strokesRef.current = strokesRef.current.filter((s) => s.client_id !== clientId)
-    requestRender()
+    if (!window.confirm('¿Borrar todos tus píxeles?')) return
+    const toErase: number[] = []
+    for (const [key, meta] of attributionRef.current) {
+      if (meta.client_id === clientId) toErase.push(key)
+    }
+    for (const key of toErase) erasePixelLocal(xFromIdx(key), yFromIdx(key))
+    if (toErase.length > 0) requestRender()
     channelRef.current?.send({
       type: 'broadcast',
       event: 'clear-mine',
       payload: { client_id: clientId },
     })
-    const { error: err } = await supabase.from('strokes').delete().eq('client_id', clientId)
+    const { error: err } = await supabase.from('pixels').delete().eq('client_id', clientId)
     if (err) setError(err.message)
   }
 
@@ -659,7 +738,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         onPointerUp={onPointerUp}
         onPointerCancel={onPointerUp}
         onPointerLeave={(e) => {
-          if (myStrokeRef.current) onPointerUp(e)
+          if (drawingRef.current) onPointerUp(e)
           else if (hover) setHover(null)
         }}
         onWheel={onWheel}
@@ -694,31 +773,33 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         })}
       </div>
 
-      {/* Author tooltip while hovering a stroke */}
-      {hover && !myStrokeRef.current && (
+      {/* Author tooltip while hovering a painted pixel */}
+      {hover && !drawingRef.current && (
         <div
           className="pointer-events-none absolute z-30 rounded-md border border-slate-300 bg-white/95 px-2 py-1 text-[11px] text-slate-800 shadow"
           style={{ left: hover.sx + 14, top: hover.sy + 14 }}
         >
           <span
-            className="mr-1.5 inline-block h-2.5 w-2.5 rounded-full align-middle"
-            style={{ background: hover.stroke.color }}
+            className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm border border-slate-400/40 align-middle"
+            style={{ background: hover.meta.color }}
           />
-          Trazo de <strong>{hover.stroke.nickname}</strong>
+          ({hover.x},{hover.y}) · <strong>{hover.meta.nickname}</strong>
         </div>
       )}
 
-      {/* Toolbar (only visible while drawing is the active mode) */}
+      {/* Toolbar */}
       {interactive && (
         <Toolbar
           color={color}
-          onColor={setColor}
+          onColor={(c) => { setColor(c); setTool('paint') }}
           width={width}
           onWidth={setWidth}
+          tool={tool}
+          onTool={setTool}
           zoom={zoom}
           onZoomIn={() => zoomBy(1.25)}
           onZoomOut={() => zoomBy(1 / 1.25)}
-          onResetView={resetView}
+          onResetView={fitToScreen}
           onClearMine={clearMine}
           canClear={chatEnabled}
         />
@@ -727,7 +808,13 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       {/* Bottom hint */}
       {interactive && (
         <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] uppercase tracking-widest text-slate-500">
-          Lienzo {CANVAS_SIZE}×{CANVAS_SIZE} · Click para dibujar · Rueda zoom · Espacio o click derecho mueve · 0 ajusta vista
+          Lienzo {CANVAS_SIZE}×{CANVAS_SIZE} · Click pinta píxeles · B/E pintar/borrar · Rueda zoom · Espacio mueve · 0 ajusta
+        </div>
+      )}
+
+      {loading && (
+        <div className="pointer-events-none absolute right-4 top-20 rounded-lg border border-slate-300 bg-white/95 px-3 py-2 text-xs text-slate-700 shadow">
+          Cargando lienzo…
         </div>
       )}
 
@@ -738,8 +825,14 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         </div>
       )}
       {error && (
-        <div className="pointer-events-none absolute left-4 top-20 max-w-xs rounded-lg border border-rose-300 bg-rose-50/95 px-3 py-2 text-xs text-rose-900 shadow">
+        <div className="pointer-events-auto absolute left-4 top-20 max-w-xs rounded-lg border border-rose-300 bg-rose-50/95 px-3 py-2 text-xs text-rose-900 shadow">
           {error}
+          <button
+            onClick={() => setError(null)}
+            className="ml-2 rounded px-1 text-rose-700 hover:bg-rose-100"
+          >
+            ×
+          </button>
         </div>
       )}
     </div>
@@ -765,6 +858,8 @@ interface ToolbarProps {
   onColor: (c: string) => void
   width: number
   onWidth: (w: number) => void
+  tool: Tool
+  onTool: (t: Tool) => void
   zoom: number
   onZoomIn: () => void
   onZoomOut: () => void
@@ -778,6 +873,8 @@ function Toolbar({
   onColor,
   width,
   onWidth,
+  tool,
+  onTool,
   zoom,
   onZoomIn,
   onZoomOut,
@@ -785,16 +882,17 @@ function Toolbar({
   onClearMine,
   canClear,
 }: ToolbarProps) {
+  const dimColors = tool === 'erase'
   return (
     <div className="pointer-events-none absolute left-1/2 top-4 z-30 -translate-x-1/2">
       <div className="pointer-events-auto flex flex-wrap items-center gap-3 rounded-2xl border border-slate-300 bg-white/95 px-3 py-2 shadow-lg backdrop-blur">
-        <div className="flex items-center gap-1">
+        <div className={`flex items-center gap-1 transition ${dimColors ? 'opacity-50' : ''}`}>
           {PALETTE.map((c) => (
             <button
               key={c}
               onClick={() => onColor(c)}
               className={`h-6 w-6 rounded-full border transition ${
-                color === c
+                color === c && !dimColors
                   ? 'border-slate-900 ring-2 ring-slate-900/30'
                   : 'border-slate-300 hover:scale-110'
               }`}
@@ -808,20 +906,48 @@ function Toolbar({
         <div className="h-6 w-px bg-slate-200" />
 
         <div className="flex items-center gap-1">
+          <button
+            onClick={() => onTool('paint')}
+            className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-xs transition ${
+              tool === 'paint'
+                ? 'border-slate-900 bg-slate-900 text-white'
+                : 'border-slate-300 text-slate-700 hover:bg-slate-50'
+            }`}
+            title="Pintar (B)"
+          >
+            <span aria-hidden>✏️</span>
+            <span>Pintar</span>
+          </button>
+          <button
+            onClick={() => onTool('erase')}
+            className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-xs transition ${
+              tool === 'erase'
+                ? 'border-slate-900 bg-slate-900 text-white'
+                : 'border-slate-300 text-slate-700 hover:bg-slate-50'
+            }`}
+            title="Borrar (E)"
+          >
+            <span aria-hidden>🧽</span>
+            <span>Borrar</span>
+          </button>
+        </div>
+
+        <div className="h-6 w-px bg-slate-200" />
+
+        <div className="flex items-center gap-1">
           {SIZES.map((s) => (
             <button
               key={s}
               onClick={() => onWidth(s)}
-              className={`flex h-7 w-7 items-center justify-center rounded-lg border text-slate-700 transition ${
-                width === s ? 'border-slate-900 bg-slate-100' : 'border-slate-300 hover:bg-slate-50'
+              className={`flex h-7 min-w-[1.75rem] items-center justify-center rounded-lg border px-1 text-[11px] font-mono transition ${
+                width === s
+                  ? 'border-slate-900 bg-slate-100 text-slate-900'
+                  : 'border-slate-300 text-slate-700 hover:bg-slate-50'
               }`}
-              title={`Grosor ${s}`}
-              aria-label={`Grosor ${s}`}
+              title={`Brocha ${s} px`}
+              aria-label={`Brocha ${s} px`}
             >
-              <span
-                className="block rounded-full bg-current"
-                style={{ width: Math.min(s, 16), height: Math.min(s, 16) }}
-              />
+              {s}px
             </button>
           ))}
         </div>
@@ -860,7 +986,7 @@ function Toolbar({
           onClick={onClearMine}
           disabled={!canClear}
           className="rounded-lg border border-rose-300 px-2 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-40"
-          title="Borrar mis trazos"
+          title="Borrar mis píxeles"
         >
           Borrar míos
         </button>
