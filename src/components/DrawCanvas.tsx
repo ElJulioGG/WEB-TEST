@@ -3,7 +3,17 @@ import type { RealtimeChannel } from '@supabase/supabase-js'
 import { supabase, chatEnabled } from '../lib/supabase'
 
 interface Point { x: number; y: number }
-type Tool = 'paint' | 'erase'
+type Tool = 'paint' | 'erase' | 'stamp'
+
+interface StampData {
+  // Rasterized image buffer used both for stamping and the preview
+  // overlay. `bitmap` is an HTMLCanvasElement created via toCanvas().
+  bitmap: HTMLCanvasElement
+  width: number
+  height: number
+  data: Uint8ClampedArray
+  name: string
+}
 
 interface Cursor {
   client_id: string
@@ -26,10 +36,12 @@ const PALETTE = [
   '#22c55e', '#0ea5e9', '#8b5cf6', '#ec4899',
 ]
 const SIZES = [1, 2, 4, 8]
+const STAMP_SIZES = [32, 64, 128, 256]
 const CURSOR_TTL_MS = 5000
 const CANVAS_SIZE = 4000
 const ZOOM_MIN = 0.05
 const ZOOM_MAX = 32
+const INITIAL_ZOOM = 0.5
 const HISTORY_PAGE = 5000
 // Realtime pacing
 const BATCH_INTERVAL_MS = 50
@@ -37,6 +49,8 @@ const CURSOR_INTERVAL_MS = 35
 // DB chunking
 const UPSERT_CHUNK = 1000
 const DELETE_CHUNK = 200
+// Stamp broadcasts use multi-color batches; same chunk size as upserts.
+const MULTI_BATCH_CHUNK = 2000
 
 function idxOf(x: number, y: number) {
   return x * CANVAS_SIZE + y
@@ -54,6 +68,46 @@ function clampPx(v: number) {
 }
 function isInsideCanvas(x: number, y: number) {
   return x >= 0 && x < CANVAS_SIZE && y >= 0 && y < CANVAS_SIZE
+}
+
+function rgbToHex(r: number, g: number, b: number) {
+  const v = ((r & 0xff) << 16) | ((g & 0xff) << 8) | (b & 0xff)
+  return '#' + v.toString(16).padStart(6, '0')
+}
+
+function rasterizeStamp(img: HTMLImageElement, maxSize: number, name: string): StampData {
+  const ratio = Math.min(maxSize / img.width, maxSize / img.height, 1)
+  const w = Math.max(1, Math.round(img.width * ratio))
+  const h = Math.max(1, Math.round(img.height * ratio))
+  const c = document.createElement('canvas')
+  c.width = w
+  c.height = h
+  const ctx = c.getContext('2d', { willReadFrequently: true })!
+  ctx.imageSmoothingEnabled = true
+  ctx.drawImage(img, 0, 0, w, h)
+  return {
+    bitmap: c,
+    width: w,
+    height: h,
+    data: ctx.getImageData(0, 0, w, h).data,
+    name,
+  }
+}
+
+function loadImageFile(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const img = new Image()
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(img)
+    }
+    img.onerror = (e) => {
+      URL.revokeObjectURL(url)
+      reject(e)
+    }
+    img.src = url
+  })
 }
 
 function stableColor(seed: string) {
@@ -92,13 +146,16 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   const [color, setColor] = useState<string>('#0f172a')
   const [tool, setTool] = useState<Tool>('paint')
   const [width, setWidthState] = useState<number>(2)
-  const [zoom, setZoomState] = useState<number>(1)
+  const [zoom, setZoomState] = useState<number>(INITIAL_ZOOM)
   const [pan, setPanState] = useState<Point>({ x: 0, y: 0 })
   const [hover, setHover] = useState<{ meta: PixelMeta; x: number; y: number; sx: number; sy: number } | null>(null)
   const [, setCursorTick] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [spaceDown, setSpaceDownState] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [stamp, setStampState] = useState<StampData | null>(null)
+  const [stampSize, setStampSizeState] = useState<number>(128)
+  const [stamping, setStamping] = useState(false)
 
   const colorRef = useRef(color)
   const widthRef = useRef(width)
@@ -107,6 +164,12 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   const panRef = useRef(pan)
   const spaceDownRef = useRef(false)
   const interactiveRef = useRef(interactive)
+  const stampRef = useRef<StampData | null>(null)
+  const stampSizeRef = useRef(128)
+  const stampSourceRef = useRef<HTMLImageElement | null>(null)
+  // Cursor world position when in stamp mode (for the live preview).
+  const stampHoverRef = useRef<Point | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Pixel attribution: idx -> {color, client_id, nickname}
   const attributionRef = useRef<Map<number, PixelMeta>>(new Map())
@@ -133,6 +196,8 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
   useEffect(() => { colorRef.current = color }, [color])
   useEffect(() => { widthRef.current = width }, [width])
   useEffect(() => { toolRef.current = tool }, [tool])
+  useEffect(() => { stampRef.current = stamp }, [stamp])
+  useEffect(() => { stampSizeRef.current = stampSize }, [stampSize])
   useEffect(() => {
     interactiveRef.current = interactive
     if (!interactive) {
@@ -140,6 +205,8 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       spaceDownRef.current = false
       setSpaceDownState(false)
       panStateRef.current = null
+      stampHoverRef.current = null
+      requestRender()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [interactive])
@@ -203,6 +270,21 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       // Crisp pixels when zoomed in; smooth resampling when zoomed out.
       ctx.imageSmoothingEnabled = z < 1
       ctx.drawImage(off, 0, 0)
+    }
+
+    // Stamp preview overlay (local-only, semi-transparent at cursor).
+    const sd = stampRef.current
+    const hover = stampHoverRef.current
+    if (toolRef.current === 'stamp' && sd && hover) {
+      ctx.imageSmoothingEnabled = false
+      ctx.globalAlpha = 0.55
+      const sx = Math.round(hover.x - sd.width / 2)
+      const sy = Math.round(hover.y - sd.height / 2)
+      ctx.drawImage(sd.bitmap, sx, sy)
+      ctx.globalAlpha = 1
+      ctx.strokeStyle = 'rgba(15, 23, 42, 0.6)'
+      ctx.lineWidth = Math.max(1 / z, 0.5)
+      ctx.strokeRect(sx + 0.5, sy + 0.5, sd.width - 1, sd.height - 1)
     }
 
     ctx.imageSmoothingEnabled = true
@@ -414,7 +496,7 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       sizeRef.current = { w, h, dpr }
       if (!fittedRef.current && w > 0 && h > 0) {
         fittedRef.current = true
-        fitToScreen()
+        resetView()
         return
       }
       requestRender()
@@ -425,12 +507,11 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     return () => observer.disconnect()
   }, [])
 
-  function fitToScreen() {
+  // Initial / reset view: 50% zoom, page centered in the viewport.
+  function resetView() {
     const { w, h } = sizeRef.current
     if (w <= 0 || h <= 0) return
-    const padding = 40
-    const fit = Math.min((w - padding) / CANVAS_SIZE, (h - padding) / CANVAS_SIZE)
-    const next = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, fit))
+    const next = INITIAL_ZOOM
     setZoom(next)
     setPan({
       x: -(w - CANVAS_SIZE * next) / 2 / next,
@@ -498,6 +579,17 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         }
         requestRender()
       })
+      .on('broadcast', { event: 'pixel-batch-multi' }, ({ payload }) => {
+        if (!payload || payload.client_id === clientId) return
+        const ops = payload.ops as [number, number, string][] | undefined
+        if (!ops || ops.length === 0) return
+        const meta = { client_id: payload.client_id, nickname: payload.nickname }
+        for (const [x, y, c] of ops) {
+          if (!isInsideCanvas(x, y)) continue
+          paintPixelLocal(x, y, c, meta)
+        }
+        requestRender()
+      })
       .on('broadcast', { event: 'clear-mine' }, ({ payload }) => {
         const cid = payload?.client_id
         if (!cid) return
@@ -550,6 +642,90 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     try { target.setPointerCapture(pointerId) } catch { /* noop */ }
   }
 
+  // ---- Stamp tool --------------------------------------------------------
+  async function pickStampFile(file: File) {
+    try {
+      const img = await loadImageFile(file)
+      stampSourceRef.current = img
+      const data = rasterizeStamp(img, stampSizeRef.current, file.name)
+      setStampState(data)
+      setTool('stamp')
+    } catch (err) {
+      setError('No se pudo leer la imagen.')
+      console.warn('stamp load failed', err)
+    }
+  }
+
+  function rebuildStampAtSize(maxSize: number) {
+    const img = stampSourceRef.current
+    if (!img) return
+    const data = rasterizeStamp(img, maxSize, stampRef.current?.name ?? 'imagen')
+    setStampState(data)
+  }
+
+  function setStampSize(size: number) {
+    setStampSizeState(size)
+    rebuildStampAtSize(size)
+  }
+
+  function clearStamp() {
+    stampSourceRef.current = null
+    setStampState(null)
+    if (toolRef.current === 'stamp') setTool('paint')
+    requestRender()
+  }
+
+  async function stampAt(cx: number, cy: number) {
+    const sd = stampRef.current
+    if (!sd) return
+    setStamping(true)
+    try {
+      const { data, width: w, height: h } = sd
+      const startX = Math.round(cx - w / 2)
+      const startY = Math.round(cy - h / 2)
+      const ops: [number, number, string][] = []
+      const meta = { client_id: clientId, nickname }
+      const dirty = sessionDirtyRef.current
+      for (let iy = 0; iy < h; iy++) {
+        for (let ix = 0; ix < w; ix++) {
+          const i = (iy * w + ix) * 4
+          if (data[i + 3] < 128) continue // skip transparent
+          const px = startX + ix
+          const py = startY + iy
+          if (!isInsideCanvas(px, py)) continue
+          const c = rgbToHex(data[i], data[i + 1], data[i + 2])
+          paintPixelLocal(px, py, c, meta)
+          ops.push([px, py, c])
+          dirty.set(idxOf(px, py), { x: px, y: py, color: c })
+        }
+      }
+      if (ops.length === 0) {
+        setStamping(false)
+        return
+      }
+      requestRender()
+
+      // Broadcast in chunks (multi-color batch).
+      const ch = channelRef.current
+      if (ch) {
+        for (let i = 0; i < ops.length; i += MULTI_BATCH_CHUNK) {
+          ch.send({
+            type: 'broadcast',
+            event: 'pixel-batch-multi',
+            payload: {
+              client_id: clientId,
+              nickname,
+              ops: ops.slice(i, i + MULTI_BATCH_CHUNK),
+            },
+          })
+        }
+      }
+      await flushPersist()
+    } finally {
+      setStamping(false)
+    }
+  }
+
   function onPointerDown(e: React.PointerEvent) {
     const canvas = canvasRef.current
     if (!canvas) return
@@ -569,6 +745,15 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       broadcastCursor(world, false, true)
       return
     }
+
+    // Stamp tool: a single click stamps the loaded image, no drag stroke.
+    if (toolRef.current === 'stamp' && stampRef.current) {
+      setHover(null)
+      broadcastCursor(world, true, true)
+      stampAt(clampPx(world.x), clampPx(world.y))
+      return
+    }
+
     setHover(null)
     try { (e.target as HTMLElement).setPointerCapture(e.pointerId) } catch { /* noop */ }
     startStroke(clampPx(world.x), clampPx(world.y))
@@ -606,6 +791,21 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     }
 
     broadcastCursor(world, false)
+
+    // Live stamp preview when stamp tool is active.
+    if (toolRef.current === 'stamp' && stampRef.current) {
+      if (isInsideCanvas(world.x, world.y)) {
+        stampHoverRef.current = { x: world.x, y: world.y }
+      } else {
+        stampHoverRef.current = null
+      }
+      requestRender()
+      if (hover) setHover(null)
+      return
+    } else if (stampHoverRef.current) {
+      stampHoverRef.current = null
+      requestRender()
+    }
 
     // Hover attribution: show who painted the pixel under the cursor.
     const hx = Math.floor(world.x)
@@ -676,11 +876,13 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         zoomBy(1 / 1.2)
       } else if (e.key === '0') {
         e.preventDefault()
-        fitToScreen()
+        resetView()
       } else if (e.key.toLowerCase() === 'e') {
         setTool('erase')
       } else if (e.key.toLowerCase() === 'b') {
         setTool('paint')
+      } else if (e.key.toLowerCase() === 's') {
+        if (stampRef.current) setTool('stamp')
       }
     }
     function up(e: KeyboardEvent) {
@@ -740,6 +942,10 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         onPointerLeave={(e) => {
           if (drawingRef.current) onPointerUp(e)
           else if (hover) setHover(null)
+          if (stampHoverRef.current) {
+            stampHoverRef.current = null
+            requestRender()
+          }
         }}
         onWheel={onWheel}
         onContextMenu={(e) => e.preventDefault()}
@@ -795,20 +1001,52 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
           width={width}
           onWidth={setWidth}
           tool={tool}
-          onTool={setTool}
+          onTool={(t) => {
+            if (t === 'stamp') {
+              if (stampRef.current) setTool('stamp')
+              else fileInputRef.current?.click()
+            } else {
+              setTool(t)
+            }
+          }}
           zoom={zoom}
           onZoomIn={() => zoomBy(1.25)}
           onZoomOut={() => zoomBy(1 / 1.25)}
-          onResetView={fitToScreen}
+          onResetView={resetView}
           onClearMine={clearMine}
           canClear={chatEnabled}
+          stamp={stamp}
+          stampSize={stampSize}
+          onStampSize={setStampSize}
+          onPickStamp={() => fileInputRef.current?.click()}
+          onClearStamp={clearStamp}
         />
       )}
+
+      {/* Hidden file input used by the stamp tool */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(e) => {
+          const file = e.target.files?.[0]
+          if (file) pickStampFile(file)
+          // Reset so picking the same file twice fires onChange.
+          e.target.value = ''
+        }}
+      />
 
       {/* Bottom hint */}
       {interactive && (
         <div className="pointer-events-none absolute bottom-4 left-1/2 -translate-x-1/2 text-[10px] uppercase tracking-widest text-slate-500">
-          Lienzo {CANVAS_SIZE}×{CANVAS_SIZE} · Click pinta píxeles · B/E pintar/borrar · Rueda zoom · Espacio mueve · 0 ajusta
+          Lienzo {CANVAS_SIZE}×{CANVAS_SIZE} · B pintar · E borrar · S estampar · Rueda zoom · Espacio mueve · 0 ajusta
+        </div>
+      )}
+
+      {stamping && (
+        <div className="pointer-events-none absolute right-4 top-20 rounded-lg border border-slate-300 bg-white/95 px-3 py-2 text-xs text-slate-700 shadow">
+          Estampando…
         </div>
       )}
 
@@ -866,6 +1104,11 @@ interface ToolbarProps {
   onResetView: () => void
   onClearMine: () => void
   canClear: boolean
+  stamp: StampData | null
+  stampSize: number
+  onStampSize: (size: number) => void
+  onPickStamp: () => void
+  onClearStamp: () => void
 }
 
 function Toolbar({
@@ -881,8 +1124,13 @@ function Toolbar({
   onResetView,
   onClearMine,
   canClear,
+  stamp,
+  stampSize,
+  onStampSize,
+  onPickStamp,
+  onClearStamp,
 }: ToolbarProps) {
-  const dimColors = tool === 'erase'
+  const dimColors = tool !== 'paint'
   return (
     <div className="pointer-events-none absolute left-1/2 top-4 z-30 -translate-x-1/2">
       <div className="pointer-events-auto flex flex-wrap items-center gap-3 rounded-2xl border border-slate-300 bg-white/95 px-3 py-2 shadow-lg backdrop-blur">
@@ -930,11 +1178,74 @@ function Toolbar({
             <span aria-hidden>🧽</span>
             <span>Borrar</span>
           </button>
+          <button
+            onClick={() => onTool('stamp')}
+            className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-xs transition ${
+              tool === 'stamp'
+                ? 'border-slate-900 bg-slate-900 text-white'
+                : 'border-slate-300 text-slate-700 hover:bg-slate-50'
+            }`}
+            title="Estampar imagen (S)"
+          >
+            <span aria-hidden>🖼️</span>
+            <span>Estampar</span>
+          </button>
         </div>
+
+        {tool === 'stamp' && (
+          <>
+            <div className="h-6 w-px bg-slate-200" />
+            <div className="flex items-center gap-2">
+              {stamp ? (
+                <>
+                  <div className="flex items-center gap-1 rounded-lg border border-slate-300 bg-slate-50 px-1.5 py-0.5">
+                    <img
+                      src={stamp.bitmap.toDataURL()}
+                      alt={stamp.name}
+                      className="h-6 w-6 rounded object-contain"
+                      style={{ imageRendering: 'pixelated' }}
+                    />
+                    <span className="max-w-[7rem] truncate text-[11px] text-slate-700">{stamp.name}</span>
+                    <button
+                      onClick={onClearStamp}
+                      className="rounded px-1 text-[11px] text-slate-500 hover:bg-slate-200"
+                      title="Quitar estampa"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-1">
+                    {STAMP_SIZES.map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => onStampSize(s)}
+                        className={`flex h-7 min-w-[2.25rem] items-center justify-center rounded-lg border px-1 text-[11px] font-mono transition ${
+                          stampSize === s
+                            ? 'border-slate-900 bg-slate-100 text-slate-900'
+                            : 'border-slate-300 text-slate-700 hover:bg-slate-50'
+                        }`}
+                        title={`Tamaño ${s} px`}
+                      >
+                        {s}px
+                      </button>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <button
+                  onClick={onPickStamp}
+                  className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+                >
+                  Cargar imagen…
+                </button>
+              )}
+            </div>
+          </>
+        )}
 
         <div className="h-6 w-px bg-slate-200" />
 
-        <div className="flex items-center gap-1">
+        <div className={`flex items-center gap-1 transition ${tool === 'stamp' ? 'opacity-50' : ''}`}>
           {SIZES.map((s) => (
             <button
               key={s}
@@ -966,7 +1277,7 @@ function Toolbar({
           <button
             onClick={onResetView}
             className="min-w-[3.25rem] rounded-lg border border-slate-300 px-2 py-1 text-xs font-mono hover:bg-slate-50"
-            title="Ajustar lienzo a la vista (0)"
+            title="Restablecer vista al 50% (0)"
           >
             {Math.round(zoom * 100)}%
           </button>
