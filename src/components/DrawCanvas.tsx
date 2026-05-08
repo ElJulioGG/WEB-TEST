@@ -48,7 +48,10 @@ const CANVAS_SIZE = 4000
 const ZOOM_MIN = 0.05
 const ZOOM_MAX = 32
 const INITIAL_ZOOM = 0.5
-const HISTORY_PAGE = 5000
+// PostgREST caps single-response row counts (default 1000 in Supabase). We
+// page in chunks of 1000 and keep going until the server returns an empty
+// page — never trust `data.length < HISTORY_PAGE` as "end of stream".
+const HISTORY_PAGE = 1000
 // Realtime pacing
 const BATCH_INTERVAL_MS = 50
 const CURSOR_INTERVAL_MS = 35
@@ -625,6 +628,9 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     ;(async () => {
       let from = 0
       let total = 0
+      // Loop until the server returns an empty page. Do NOT break on
+      // `data.length < HISTORY_PAGE` — PostgREST caps responses, so a short
+      // page does not mean "end of data" when the requested range was larger.
       while (!cancelled) {
         const { data, error: err } = await supabase!
           .from('pixels')
@@ -644,7 +650,6 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         total += data.length
         setHistoryCount(total)
         requestRender()
-        if (data.length < HISTORY_PAGE) break
         from += data.length
       }
       console.log(`[draw] history load complete: ${total} pixels`)
