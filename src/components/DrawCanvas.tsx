@@ -626,33 +626,93 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     setLoading(true)
 
     ;(async () => {
-      let from = 0
-      let total = 0
-      // Loop until the server returns an empty page. Do NOT break on
-      // `data.length < HISTORY_PAGE` — PostgREST caps responses, so a short
-      // page does not mean "end of data" when the requested range was larger.
-      while (!cancelled) {
+      const t0 = performance.now()
+      const off = offscreenRef.current
+      const offCtx = off?.getContext('2d') ?? null
+      if (!off || !offCtx) return
+
+      // Get the exact row count first so we can fan out parallel range
+      // requests instead of paging sequentially. PostgREST caps responses at
+      // 1000 rows, so for thousands of pixels the sequential loop is the
+      // dominant cost — many round-trips at ~100-300ms each.
+      const { count, error: countErr } = await supabase!
+        .from('pixels')
+        .select('*', { count: 'exact', head: true })
+      if (cancelled) return
+      if (countErr) {
+        console.error('[draw] history count failed:', countErr.message, countErr)
+        setError(`No se pudo cargar el historial: ${countErr.message}`)
+        if (!cancelled) setLoading(false)
+        return
+      }
+      const totalRows = count ?? 0
+      if (totalRows === 0) {
+        console.log('[draw] history load complete: 0 pixels')
+        if (!cancelled) setLoading(false)
+        return
+      }
+
+      // Build a single ImageData buffer for the offscreen canvas; writing
+      // pixel bytes directly is dramatically faster than thousands of
+      // fillRect calls. We blit it once at the end.
+      const imageData = offCtx.createImageData(CANVAS_SIZE, CANVAS_SIZE)
+      const px = imageData.data
+      const totalPages = Math.ceil(totalRows / HISTORY_PAGE)
+      let loaded = 0
+      let pageCursor = 0
+      let aborted = false
+      const CONCURRENCY = 6
+
+      async function fetchPage(pageIdx: number) {
+        const fromRow = pageIdx * HISTORY_PAGE
         const { data, error: err } = await supabase!
           .from('pixels')
           .select('x, y, color, client_id, nickname')
           .order('idx', { ascending: true })
-          .range(from, from + HISTORY_PAGE - 1)
-        if (cancelled) return
+          .range(fromRow, fromRow + HISTORY_PAGE - 1)
         if (err) {
-          console.error('[draw] history load failed:', err.message, err)
+          console.error('[draw] history page', pageIdx, 'failed:', err.message, err)
           setError(`No se pudo cargar el historial: ${err.message}`)
-          break
+          aborted = true
+          return
         }
-        if (!data || data.length === 0) break
-        for (const row of data as { x: number; y: number; color: string; client_id: string; nickname: string }[]) {
-          paintPixelLocal(row.x, row.y, row.color, { client_id: row.client_id, nickname: row.nickname })
+        if (!data) return
+        const rows = data as { x: number; y: number; color: string; client_id: string; nickname: string }[]
+        for (const row of rows) {
+          // Hex like "#rrggbb" -> bytes
+          const v = parseInt(row.color.slice(1), 16) | 0
+          const i = (row.y * CANVAS_SIZE + row.x) * 4
+          px[i] = (v >> 16) & 0xff
+          px[i + 1] = (v >> 8) & 0xff
+          px[i + 2] = v & 0xff
+          px[i + 3] = 255
+          attributionRef.current.set(idxOf(row.x, row.y), {
+            color: row.color,
+            client_id: row.client_id,
+            nickname: row.nickname,
+          })
         }
-        total += data.length
-        setHistoryCount(total)
-        requestRender()
-        from += data.length
+        loaded += rows.length
+        setHistoryCount(loaded)
       }
-      console.log(`[draw] history load complete: ${total} pixels`)
+
+      async function worker() {
+        while (!cancelled && !aborted) {
+          const i = pageCursor++
+          if (i >= totalPages) return
+          await fetchPage(i)
+        }
+      }
+
+      await Promise.all(Array.from({ length: CONCURRENCY }, worker))
+      if (cancelled) return
+
+      // Single blit: WAY cheaper than tens of thousands of fillRect calls.
+      offCtx.putImageData(imageData, 0, 0)
+      requestRender()
+
+      const ms = Math.round(performance.now() - t0)
+      console.log(`[draw] history load complete: ${loaded} pixels in ${ms}ms`)
       if (!cancelled) setLoading(false)
     })()
 
