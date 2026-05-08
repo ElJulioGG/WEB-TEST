@@ -633,79 +633,61 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       if (!offCtx) return
       const ctx2d: CanvasRenderingContext2D = offCtx
 
-      // Get the exact row count first so we can fan out parallel range
-      // requests instead of paging sequentially. PostgREST caps responses at
-      // 1000 rows, so for thousands of pixels the sequential loop is the
-      // dominant cost — many round-trips at ~100-300ms each.
-      const { count, error: countErr } = await supabase!
-        .from('pixels')
-        .select('*', { count: 'exact', head: true })
+      // Run the row count and the very first visual page in parallel so we
+      // start rendering pixels at minimum t1 = round-trip * 1.
+      const [countRes, firstPageRes] = await Promise.all([
+        supabase!.from('pixels').select('*', { count: 'exact', head: true }),
+        supabase!
+          .from('pixels')
+          .select('x, y, color')
+          .order('idx', { ascending: true })
+          .range(0, HISTORY_PAGE - 1),
+      ])
       if (cancelled) return
-      if (countErr) {
-        console.error('[draw] history count failed:', countErr.message, countErr)
-        setError(`No se pudo cargar el historial: ${countErr.message}`)
+      if (countRes.error) {
+        console.error('[draw] history count failed:', countRes.error.message, countRes.error)
+        setError(`No se pudo cargar el historial: ${countRes.error.message}`)
         if (!cancelled) setLoading(false)
         return
       }
-      const totalRows = count ?? 0
+      if (firstPageRes.error) {
+        console.error('[draw] history page 0 failed:', firstPageRes.error.message, firstPageRes.error)
+        setError(`No se pudo cargar el historial: ${firstPageRes.error.message}`)
+        if (!cancelled) setLoading(false)
+        return
+      }
+      const totalRows = countRes.count ?? 0
       if (totalRows === 0) {
         console.log('[draw] history load complete: 0 pixels')
         if (!cancelled) setLoading(false)
         return
       }
 
-      // Build a single ImageData buffer for the offscreen canvas; writing
-      // pixel bytes directly is dramatically faster than thousands of
-      // fillRect calls. We blit it once at the end.
       const imageData = ctx2d.createImageData(CANVAS_SIZE, CANVAS_SIZE)
       const px = imageData.data
       const totalPages = Math.ceil(totalRows / HISTORY_PAGE)
       let loaded = 0
-      let pageCursor = 0
+      let pageCursor = 1 // page 0 is already in firstPageRes
       let aborted = false
-      // Higher concurrency cuts wall time roughly linearly, up to the point
-      // where the Supabase connection pool starts queuing. 12 is comfortably
-      // below the default pool of ~60 and gives a noticeable speedup over 6.
       const CONCURRENCY = 12
 
-      async function fetchPage(pageIdx: number) {
-        const fromRow = pageIdx * HISTORY_PAGE
-        const { data, error: err } = await supabase!
-          .from('pixels')
-          .select('x, y, color, client_id, nickname')
-          .order('idx', { ascending: true })
-          .range(fromRow, fromRow + HISTORY_PAGE - 1)
-        if (err) {
-          console.error('[draw] history page', pageIdx, 'failed:', err.message, err)
-          setError(`No se pudo cargar el historial: ${err.message}`)
-          aborted = true
-          return
-        }
-        if (!data || data.length === 0) return
-        const rows = data as { x: number; y: number; color: string; client_id: string; nickname: string }[]
-        // Track this page's bounding box so we can blit just its region.
+      // Apply a fetched visual page (idx + color only) to the ImageData
+      // buffer and blit just its sub-rectangle into the offscreen canvas.
+      function applyVisualPage(rows: { x: number; y: number; color: string }[]) {
+        if (rows.length === 0) return
         let minX = CANVAS_SIZE - 1, maxX = 0, minY = CANVAS_SIZE - 1, maxY = 0
         for (const row of rows) {
-          // Hex like "#rrggbb" -> bytes
           const v = parseInt(row.color.slice(1), 16) | 0
           const i = (row.y * CANVAS_SIZE + row.x) * 4
           px[i] = (v >> 16) & 0xff
           px[i + 1] = (v >> 8) & 0xff
           px[i + 2] = v & 0xff
           px[i + 3] = 255
-          attributionRef.current.set(idxOf(row.x, row.y), {
-            color: row.color,
-            client_id: row.client_id,
-            nickname: row.nickname,
-          })
           if (row.x < minX) minX = row.x
           if (row.x > maxX) maxX = row.x
           if (row.y < minY) minY = row.y
           if (row.y > maxY) maxY = row.y
         }
-        // Partial blit: copy only the dirty sub-rectangle of this page into
-        // the offscreen canvas, then schedule a render. Result: each page's
-        // pixels appear on the visible canvas as soon as it loads.
         const dw = maxX - minX + 1
         const dh = maxY - minY + 1
         if (dw > 0 && dh > 0) {
@@ -716,20 +698,88 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         requestRender()
       }
 
-      async function worker() {
+      // PHASE 1: fast visual load. We omit client_id / nickname here — those
+      // are by far the heaviest fields per row (~60% of payload) and are
+      // only needed for the hover-attribution tooltip, which is fine to
+      // backfill after the canvas is already on screen.
+      applyVisualPage((firstPageRes.data ?? []) as { x: number; y: number; color: string }[])
+
+      async function fetchVisualPage(pageIdx: number) {
+        const fromRow = pageIdx * HISTORY_PAGE
+        const { data, error: err } = await supabase!
+          .from('pixels')
+          .select('x, y, color')
+          .order('idx', { ascending: true })
+          .range(fromRow, fromRow + HISTORY_PAGE - 1)
+        if (err) {
+          console.error('[draw] visual page', pageIdx, 'failed:', err.message, err)
+          setError(`No se pudo cargar el historial: ${err.message}`)
+          aborted = true
+          return
+        }
+        applyVisualPage((data ?? []) as { x: number; y: number; color: string }[])
+      }
+
+      async function visualWorker() {
         while (!cancelled && !aborted) {
           const i = pageCursor++
           if (i >= totalPages) return
-          await fetchPage(i)
+          await fetchVisualPage(i)
         }
       }
 
-      await Promise.all(Array.from({ length: CONCURRENCY }, worker))
+      await Promise.all(Array.from({ length: CONCURRENCY }, visualWorker))
       if (cancelled) return
-
-      const ms = Math.round(performance.now() - t0)
-      console.log(`[draw] history load complete: ${loaded} pixels in ${ms}ms`)
+      const visualMs = Math.round(performance.now() - t0)
+      console.log(`[draw] visual load complete: ${loaded} pixels in ${visualMs}ms`)
       if (!cancelled) setLoading(false)
+
+      // PHASE 2: attribution backfill. Runs in the background after the
+      // canvas is already visible. Lower concurrency (4) so we don't
+      // compete for bandwidth with the user's live edits.
+      if (aborted) return
+      const t1 = performance.now()
+      let attributionCursor = 0
+      let attributionLoaded = 0
+      const ATTR_CONCURRENCY = 4
+
+      async function fetchAttributionPage(pageIdx: number) {
+        const fromRow = pageIdx * HISTORY_PAGE
+        const { data, error: err } = await supabase!
+          .from('pixels')
+          .select('x, y, color, client_id, nickname')
+          .order('idx', { ascending: true })
+          .range(fromRow, fromRow + HISTORY_PAGE - 1)
+        if (err) {
+          console.warn('[draw] attribution page', pageIdx, 'failed:', err.message)
+          return
+        }
+        const rows = (data ?? []) as { x: number; y: number; color: string; client_id: string; nickname: string }[]
+        for (const row of rows) {
+          // Don't overwrite attribution from live broadcasts that may have
+          // landed during phase 1.
+          const key = idxOf(row.x, row.y)
+          if (attributionRef.current.has(key)) continue
+          attributionRef.current.set(key, {
+            color: row.color,
+            client_id: row.client_id,
+            nickname: row.nickname,
+          })
+        }
+        attributionLoaded += rows.length
+      }
+
+      async function attributionWorker() {
+        while (!cancelled && !aborted) {
+          const i = attributionCursor++
+          if (i >= totalPages) return
+          await fetchAttributionPage(i)
+        }
+      }
+
+      await Promise.all(Array.from({ length: ATTR_CONCURRENCY }, attributionWorker))
+      const attrMs = Math.round(performance.now() - t1)
+      console.log(`[draw] attribution backfill: ${attributionLoaded} entries in ${attrMs}ms`)
     })()
 
     const ch = supabase
