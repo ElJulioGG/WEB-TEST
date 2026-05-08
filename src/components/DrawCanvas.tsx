@@ -628,8 +628,10 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
     ;(async () => {
       const t0 = performance.now()
       const off = offscreenRef.current
-      const offCtx = off?.getContext('2d') ?? null
-      if (!off || !offCtx) return
+      if (!off) return
+      const offCtx: CanvasRenderingContext2D | null = off.getContext('2d')
+      if (!offCtx) return
+      const ctx2d: CanvasRenderingContext2D = offCtx
 
       // Get the exact row count first so we can fan out parallel range
       // requests instead of paging sequentially. PostgREST caps responses at
@@ -655,13 +657,16 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       // Build a single ImageData buffer for the offscreen canvas; writing
       // pixel bytes directly is dramatically faster than thousands of
       // fillRect calls. We blit it once at the end.
-      const imageData = offCtx.createImageData(CANVAS_SIZE, CANVAS_SIZE)
+      const imageData = ctx2d.createImageData(CANVAS_SIZE, CANVAS_SIZE)
       const px = imageData.data
       const totalPages = Math.ceil(totalRows / HISTORY_PAGE)
       let loaded = 0
       let pageCursor = 0
       let aborted = false
-      const CONCURRENCY = 6
+      // Higher concurrency cuts wall time roughly linearly, up to the point
+      // where the Supabase connection pool starts queuing. 12 is comfortably
+      // below the default pool of ~60 and gives a noticeable speedup over 6.
+      const CONCURRENCY = 12
 
       async function fetchPage(pageIdx: number) {
         const fromRow = pageIdx * HISTORY_PAGE
@@ -676,8 +681,10 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
           aborted = true
           return
         }
-        if (!data) return
+        if (!data || data.length === 0) return
         const rows = data as { x: number; y: number; color: string; client_id: string; nickname: string }[]
+        // Track this page's bounding box so we can blit just its region.
+        let minX = CANVAS_SIZE - 1, maxX = 0, minY = CANVAS_SIZE - 1, maxY = 0
         for (const row of rows) {
           // Hex like "#rrggbb" -> bytes
           const v = parseInt(row.color.slice(1), 16) | 0
@@ -691,9 +698,22 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
             client_id: row.client_id,
             nickname: row.nickname,
           })
+          if (row.x < minX) minX = row.x
+          if (row.x > maxX) maxX = row.x
+          if (row.y < minY) minY = row.y
+          if (row.y > maxY) maxY = row.y
+        }
+        // Partial blit: copy only the dirty sub-rectangle of this page into
+        // the offscreen canvas, then schedule a render. Result: each page's
+        // pixels appear on the visible canvas as soon as it loads.
+        const dw = maxX - minX + 1
+        const dh = maxY - minY + 1
+        if (dw > 0 && dh > 0) {
+          ctx2d.putImageData(imageData, 0, 0, minX, minY, dw, dh)
         }
         loaded += rows.length
         setHistoryCount(loaded)
+        requestRender()
       }
 
       async function worker() {
@@ -706,10 +726,6 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
 
       await Promise.all(Array.from({ length: CONCURRENCY }, worker))
       if (cancelled) return
-
-      // Single blit: WAY cheaper than tens of thousands of fillRect calls.
-      offCtx.putImageData(imageData, 0, 0)
-      requestRender()
 
       const ms = Math.round(performance.now() - t0)
       console.log(`[draw] history load complete: ${loaded} pixels in ${ms}ms`)
