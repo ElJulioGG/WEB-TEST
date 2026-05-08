@@ -633,46 +633,17 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       if (!offCtx) return
       const ctx2d: CanvasRenderingContext2D = offCtx
 
-      // Run the row count and the very first visual page in parallel so we
-      // start rendering pixels at minimum t1 = round-trip * 1.
-      const [countRes, firstPageRes] = await Promise.all([
-        supabase!.from('pixels').select('*', { count: 'exact', head: true }),
-        supabase!
-          .from('pixels')
-          .select('x, y, color')
-          .order('idx', { ascending: true })
-          .range(0, HISTORY_PAGE - 1),
-      ])
-      if (cancelled) return
-      if (countRes.error) {
-        console.error('[draw] history count failed:', countRes.error.message, countRes.error)
-        setError(`No se pudo cargar el historial: ${countRes.error.message}`)
-        if (!cancelled) setLoading(false)
-        return
-      }
-      if (firstPageRes.error) {
-        console.error('[draw] history page 0 failed:', firstPageRes.error.message, firstPageRes.error)
-        setError(`No se pudo cargar el historial: ${firstPageRes.error.message}`)
-        if (!cancelled) setLoading(false)
-        return
-      }
-      const totalRows = countRes.count ?? 0
-      if (totalRows === 0) {
-        console.log('[draw] history load complete: 0 pixels')
-        if (!cancelled) setLoading(false)
-        return
-      }
-
       const imageData = ctx2d.createImageData(CANVAS_SIZE, CANVAS_SIZE)
       const px = imageData.data
-      const totalPages = Math.ceil(totalRows / HISTORY_PAGE)
       let loaded = 0
-      let pageCursor = 1 // page 0 is already in firstPageRes
       let aborted = false
+      // Self-terminating worker pool: we don't query SELECT count(*) at all
+      // (an exact count over 200k+ rows hits Supabase's request timeout and
+      // returns 500). Instead, every worker processes pageCursor++ and the
+      // first one to receive a SHORT page (< HISTORY_PAGE rows) sets
+      // `lastValidPage` so the rest stop.
       const CONCURRENCY = 12
 
-      // Apply a fetched visual page (idx + color only) to the ImageData
-      // buffer and blit just its sub-rectangle into the offscreen canvas.
       function applyVisualPage(rows: { x: number; y: number; color: string }[]) {
         if (rows.length === 0) return
         let minX = CANVAS_SIZE - 1, maxX = 0, minY = CANVAS_SIZE - 1, maxY = 0
@@ -698,33 +669,54 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
         requestRender()
       }
 
-      // PHASE 1: fast visual load. We omit client_id / nickname here — those
-      // are by far the heaviest fields per row (~60% of payload) and are
-      // only needed for the hover-attribution tooltip, which is fine to
-      // backfill after the canvas is already on screen.
-      applyVisualPage((firstPageRes.data ?? []) as { x: number; y: number; color: string }[])
-
-      async function fetchVisualPage(pageIdx: number) {
+      // Fetch with one retry on transient failures (Supabase occasionally
+      // returns 500 / 503 on bursts of parallel range queries).
+      async function fetchPageWithRetry<Row>(
+        pageIdx: number,
+        select: string,
+        label: string,
+      ): Promise<Row[] | null> {
         const fromRow = pageIdx * HISTORY_PAGE
-        const { data, error: err } = await supabase!
-          .from('pixels')
-          .select('x, y, color')
-          .order('idx', { ascending: true })
-          .range(fromRow, fromRow + HISTORY_PAGE - 1)
-        if (err) {
-          console.error('[draw] visual page', pageIdx, 'failed:', err.message, err)
-          setError(`No se pudo cargar el historial: ${err.message}`)
-          aborted = true
-          return
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const { data, error: err } = await supabase!
+            .from('pixels')
+            .select(select)
+            .order('idx', { ascending: true })
+            .range(fromRow, fromRow + HISTORY_PAGE - 1)
+          if (!err) return (data ?? []) as Row[]
+          console.warn(`[draw] ${label} page ${pageIdx} attempt ${attempt + 1} failed:`, err.message || '(empty)', err)
+          if (attempt === 0) {
+            await new Promise((r) => setTimeout(r, 250 + Math.random() * 250))
+          } else {
+            return null
+          }
         }
-        applyVisualPage((data ?? []) as { x: number; y: number; color: string }[])
+        return null
       }
+
+      // PHASE 1: visual. Selects only x, y, color — heaviest fields are
+      // skipped, so the wire payload is ~3x smaller than full rows.
+      let pageCursor = 0
+      let lastValidPage = Number.POSITIVE_INFINITY
 
       async function visualWorker() {
         while (!cancelled && !aborted) {
           const i = pageCursor++
-          if (i >= totalPages) return
-          await fetchVisualPage(i)
+          if (i >= lastValidPage) return
+          const rows = await fetchPageWithRetry<{ x: number; y: number; color: string }>(
+            i, 'x, y, color', 'visual',
+          )
+          if (cancelled) return
+          if (rows === null) {
+            // Retried and still failed; surface error and bail this worker.
+            setError('Falló una página al cargar el historial. Recargá la pestaña.')
+            aborted = true
+            return
+          }
+          applyVisualPage(rows)
+          if (rows.length < HISTORY_PAGE) {
+            lastValidPage = Math.min(lastValidPage, i + 1)
+          }
         }
       }
 
@@ -734,46 +726,38 @@ export function DrawCanvas({ nickname, interactive = true }: Props) {
       console.log(`[draw] visual load complete: ${loaded} pixels in ${visualMs}ms`)
       if (!cancelled) setLoading(false)
 
-      // PHASE 2: attribution backfill. Runs in the background after the
-      // canvas is already visible. Lower concurrency (4) so we don't
-      // compete for bandwidth with the user's live edits.
+      // PHASE 2: attribution backfill (background, lower concurrency).
       if (aborted) return
       const t1 = performance.now()
       let attributionCursor = 0
+      let attributionLastValidPage = Number.POSITIVE_INFINITY
       let attributionLoaded = 0
       const ATTR_CONCURRENCY = 4
-
-      async function fetchAttributionPage(pageIdx: number) {
-        const fromRow = pageIdx * HISTORY_PAGE
-        const { data, error: err } = await supabase!
-          .from('pixels')
-          .select('x, y, color, client_id, nickname')
-          .order('idx', { ascending: true })
-          .range(fromRow, fromRow + HISTORY_PAGE - 1)
-        if (err) {
-          console.warn('[draw] attribution page', pageIdx, 'failed:', err.message)
-          return
-        }
-        const rows = (data ?? []) as { x: number; y: number; color: string; client_id: string; nickname: string }[]
-        for (const row of rows) {
-          // Don't overwrite attribution from live broadcasts that may have
-          // landed during phase 1.
-          const key = idxOf(row.x, row.y)
-          if (attributionRef.current.has(key)) continue
-          attributionRef.current.set(key, {
-            color: row.color,
-            client_id: row.client_id,
-            nickname: row.nickname,
-          })
-        }
-        attributionLoaded += rows.length
-      }
 
       async function attributionWorker() {
         while (!cancelled && !aborted) {
           const i = attributionCursor++
-          if (i >= totalPages) return
-          await fetchAttributionPage(i)
+          if (i >= attributionLastValidPage) return
+          const rows = await fetchPageWithRetry<{
+            x: number; y: number; color: string; client_id: string; nickname: string
+          }>(i, 'x, y, color, client_id, nickname', 'attribution')
+          if (cancelled) return
+          if (rows === null) return
+          for (const row of rows) {
+            const key = idxOf(row.x, row.y)
+            // Don't overwrite attribution that may have arrived via a live
+            // broadcast during phase 1 — that data is fresher.
+            if (attributionRef.current.has(key)) continue
+            attributionRef.current.set(key, {
+              color: row.color,
+              client_id: row.client_id,
+              nickname: row.nickname,
+            })
+          }
+          attributionLoaded += rows.length
+          if (rows.length < HISTORY_PAGE) {
+            attributionLastValidPage = Math.min(attributionLastValidPage, i + 1)
+          }
         }
       }
 
